@@ -1,0 +1,33 @@
+# Data and models — top-level only (large files)
+/data/
+/models/
+/outputs/
+
+# Unused/legacy scripts
+scripts/llm_filter_AD_MIMIC_no_use/
+
+# Results inside scripts (regenerable)
+scripts/echo_infer_AD/results/
+
+# Slurm logs
+scripts/echo_infer_AD/slurm/logs/
+
+# Model weight file types (anywhere)
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
