@@ -96,12 +96,6 @@ class PanEchoBackbone(nn.Module):
         """
         return self.model(x)
 
-    def unfreeze(self):
-        """Sets requires_grad=True for all backbone parameters."""
-        for param in self.model.parameters():
-            param.requires_grad = True
-        logger.info("PanEcho backbone parameters are now trainable.")
-
 
 class EchoNetDynamicBackbone(nn.Module):
     """

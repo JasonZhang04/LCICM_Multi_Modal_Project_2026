@@ -20,20 +20,17 @@ import logging
 import random
 import time
 import json
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.jhu_dataset import JHUEchoDataset
+from data.jhu_dataset import create_dataloaders
 from models.echo_classifier import AorticDilationClassifier
 from utils.training_utils import (
     FocalLoss,
@@ -41,6 +38,8 @@ from utils.training_utils import (
     compute_metrics,
     compute_metrics_at_threshold,
     aggregate_study_predictions,
+    train_one_epoch,
+    evaluate_study_level,
     save_checkpoint,
     load_checkpoint,
     format_metrics,
@@ -64,262 +63,6 @@ def set_seed(seed: int):
 
 
 # ------------------------------------------------------------------ #
-#  Data loading with WeightedRandomSampler                             #
-# ------------------------------------------------------------------ #
-
-def create_dataloaders_with_sampler(
-    labels_csv: str,
-    accession_index_path: str,
-    config: dict,
-    val_split: float = 0.15,
-    test_split: float = 0.15,
-    seed: int = 42,
-):
-    """
-    Create dataloaders with WeightedRandomSampler for balanced training.
-
-    The sampler ensures each mini-batch has roughly 50/50 normal/dilated
-    clips. This gives consistent gradient signal for the minority class
-    from the very first step.
-
-    Splitting is still done at the study level to prevent data leakage.
-    """
-    from sklearn.model_selection import train_test_split
-
-    # Load labels for study-level splitting
-    labels_df = pd.read_csv(labels_csv)
-    labels_df["accession"] = labels_df["accession"].astype(str)
-    labels_df = labels_df.dropna(subset=["label"])
-
-    with open(accession_index_path) as f:
-        acc_index = json.load(f)
-
-    labels_df = labels_df[labels_df["accession"].isin(acc_index.keys())]
-
-    accessions = labels_df["accession"].values
-    labels = labels_df["label"].astype(int).values
-
-    # Study-level stratified split
-    acc_train_val, acc_test, lab_train_val, lab_test = train_test_split(
-        accessions, labels, test_size=test_split, stratify=labels, random_state=seed
-    )
-    relative_val = val_split / (1 - test_split)
-    acc_train, acc_val, _, _ = train_test_split(
-        acc_train_val, lab_train_val, test_size=relative_val,
-        stratify=lab_train_val, random_state=seed
-    )
-
-    acc_train_set = set(acc_train)
-    acc_val_set = set(acc_val)
-    acc_test_set = set(acc_test)
-
-    logger.info(f"Study-level split — train: {len(acc_train)}, val: {len(acc_val)}, test: {len(acc_test)}")
-
-    # Create datasets
-    common_kwargs = dict(
-        labels_csv=labels_csv,
-        accession_index_path=accession_index_path,
-        num_frames=config.get("num_frames", 16),
-        frame_size=config.get("frame_size", 224),
-        min_frames_per_dicom=config.get("min_frames_per_dicom", 4),
-        max_dicoms_per_study=config.get("max_dicoms_per_study", 10),
-        normalize_mean=config.get("normalize_mean"),
-        normalize_std=config.get("normalize_std"),
-    )
-
-    train_ds = JHUEchoDataset(**common_kwargs, augment=True)
-    val_ds = JHUEchoDataset(**common_kwargs, augment=False)
-    test_ds = JHUEchoDataset(**common_kwargs, augment=False)
-
-    # Split by study
-    train_indices = [i for i, row in train_ds.samples.iterrows() if row["accession"] in acc_train_set]
-    val_indices = [i for i, row in val_ds.samples.iterrows() if row["accession"] in acc_val_set]
-    test_indices = [i for i, row in test_ds.samples.iterrows() if row["accession"] in acc_test_set]
-
-    # --- WeightedRandomSampler for training ---
-    # Assign weight to each training sample: minority class gets higher weight
-    # This ensures roughly balanced batches during training
-    train_labels = train_ds.samples.iloc[train_indices]["label"].values
-    class_counts = np.bincount(train_labels.astype(int))
-    class_weights = 1.0 / class_counts
-    sample_weights = class_weights[train_labels.astype(int)]
-    sample_weights = torch.from_numpy(sample_weights).float()
-
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True,
-    )
-
-    n_pos_train = (train_labels == 1).sum()
-    n_neg_train = (train_labels == 0).sum()
-    logger.info(
-        f"Training clips — total: {len(train_indices)}, "
-        f"normal: {n_neg_train}, dilated: {n_pos_train}, "
-        f"ratio: {n_neg_train/max(n_pos_train,1):.1f}:1"
-    )
-    logger.info(
-        f"WeightedRandomSampler active — each batch will be ~50/50 balanced"
-    )
-    logger.info(f"Val clips: {len(val_indices)}, Test clips: {len(test_indices)}")
-
-    batch_size = config.get("batch_size", 8)
-    num_workers = config.get("num_workers", 4)
-
-    train_loader = DataLoader(
-        Subset(train_ds, train_indices),
-        batch_size=batch_size,
-        sampler=sampler,          # balanced sampling instead of shuffle
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        Subset(val_ds, val_indices),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-    test_loader = DataLoader(
-        Subset(test_ds, test_indices),
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-    return train_loader, val_loader, test_loader
-
-
-# ------------------------------------------------------------------ #
-#  Training and evaluation loops                                       #
-# ------------------------------------------------------------------ #
-
-def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
-    """Train for one epoch with balanced batches."""
-    model.train()
-    total_loss = 0.0
-    all_preds, all_labels = [], []
-
-    for batch in loader:
-        video = batch["video"].to(device)
-        labels = batch["label"].to(device)
-
-        optimizer.zero_grad()
-
-        if scaler is not None:
-            with autocast():
-                logits = model(video)
-                loss = criterion(logits, labels)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits = model(video)
-            loss = criterion(logits, labels)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-        total_loss += loss.item() * video.size(0)
-        preds = logits.argmax(dim=1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(labels.cpu().numpy())
-
-    n = len(all_labels)
-    avg_loss = total_loss / max(n, 1)
-    metrics = compute_metrics(np.array(all_labels), np.array(all_preds))
-    metrics["loss"] = avg_loss
-    return metrics
-
-
-@torch.no_grad()
-def evaluate_study_level(model, loader, criterion, device):
-    """
-    Evaluate at study level with both mean and max pooling.
-
-    Reports:
-    - Clip-level metrics (raw per-clip performance)
-    - Study-level metrics with MEAN pooling (average clip probabilities)
-    - Study-level metrics with MAX pooling (take highest dilated probability)
-    - AUPRC and optimal threshold for both aggregation methods
-    """
-    model.eval()
-    total_loss = 0.0
-
-    all_probs = []
-    all_labels = []
-    all_accessions = []
-
-    for batch in loader:
-        video = batch["video"].to(device)
-        labels = batch["label"].to(device)
-        accessions = batch["accession"]
-
-        logits = model(video)
-        loss = criterion(logits, labels)
-
-        total_loss += loss.item() * video.size(0)
-        probs = torch.softmax(logits, dim=1).cpu().numpy()
-
-        all_probs.extend(probs)
-        all_labels.extend(labels.cpu().numpy())
-        all_accessions.extend(accessions)
-
-    all_probs = np.array(all_probs)
-    all_labels_arr = np.array(all_labels)
-    n_clips = len(all_labels)
-
-    # --- Study-level aggregation: MEAN ---
-    y_true_mean, y_pred_mean, y_prob_mean = aggregate_study_predictions(
-        all_accessions, all_probs, all_labels, method="mean"
-    )
-    metrics_mean = compute_metrics(y_true_mean, y_pred_mean, y_prob_mean)
-
-    # --- Study-level aggregation: MAX ---
-    y_true_max, y_pred_max, y_prob_max = aggregate_study_predictions(
-        all_accessions, all_probs, all_labels, method="max"
-    )
-    metrics_max = compute_metrics(y_true_max, y_pred_max, y_prob_max)
-
-    # --- Metrics at optimal threshold (mean pooling) ---
-    if "optimal_threshold" in metrics_mean:
-        metrics_at_opt = compute_metrics_at_threshold(
-            y_true_mean, y_prob_mean, metrics_mean["optimal_threshold"]
-        )
-    else:
-        metrics_at_opt = {}
-
-    avg_loss = total_loss / max(n_clips, 1)
-
-    # Combine into single output
-    result = {
-        "loss": avg_loss,
-        "n_studies": len(set(all_accessions)),
-        "n_clips": n_clips,
-        # Mean pooling metrics (primary)
-        "f1": metrics_mean.get("f1", 0),
-        "auc": metrics_mean.get("auc", 0),
-        "auprc": metrics_mean.get("auprc", 0),
-        "accuracy": metrics_mean.get("accuracy", 0),
-        "precision": metrics_mean.get("precision", 0),
-        "recall": metrics_mean.get("recall", 0),
-        "optimal_threshold": metrics_mean.get("optimal_threshold", 0.5),
-        "f1_at_optimal": metrics_mean.get("f1_at_optimal", 0),
-        # Max pooling metrics
-        "max_f1": metrics_max.get("f1", 0),
-        "max_auc": metrics_max.get("auc", 0),
-        "max_auprc": metrics_max.get("auprc", 0),
-        "max_recall": metrics_max.get("recall", 0),
-    }
-
-    return result
-
-
-# ------------------------------------------------------------------ #
 #  Main                                                                #
 # ------------------------------------------------------------------ #
 
@@ -340,8 +83,8 @@ def main():
     model_cfg["label_mode"] = config["labels"]["mode"]
     set_seed(train_cfg["seed"])
 
-    # backbone
-    model_cfg["backbone_lr"] = config["training"]["backbone_lr"] # Pass LR from training section
+    # Pass backbone LR from training section
+    model_cfg["backbone_lr"] = train_cfg["backbone_lr"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -360,13 +103,15 @@ def main():
         logger.error(f"Accession index not found: {accession_index_path}")
         sys.exit(1)
 
+    # Build config for dataloaders
     video_cfg = {
         **config["video"],
         "batch_size": train_cfg["batch_size"],
         "num_workers": train_cfg["num_workers"],
     }
 
-    train_loader, val_loader, test_loader = create_dataloaders_with_sampler(
+    # Use the correct create_dataloaders from jhu_dataset.py
+    train_loader, val_loader, test_loader = create_dataloaders(
         labels_csv=labels_csv,
         accession_index_path=accession_index_path,
         config=video_cfg,
@@ -393,11 +138,14 @@ def main():
     labels_df = pd.read_csv(labels_csv)
     label_counts = labels_df["label"].dropna().astype(int).value_counts().sort_index()
     total = label_counts.sum()
-    alpha = [total / (len(label_counts) * count) for count in label_counts.values]
-    logger.info(f"Focal Loss alpha (class weights): {alpha}")
-    logger.info(f"Focal Loss gamma: 2.0")
+    alpha = torch.tensor([total / (len(label_counts) * count) for count in label_counts.values])
+    logger.info(f"Focal Loss alpha (class weights): {alpha.tolist()}")
+    logger.info(f"Focal Loss gamma: {train_cfg.get('focal_gamma', 2.0)}")
 
-    criterion = FocalLoss(alpha=alpha, gamma=2.0).to(device)
+    criterion = FocalLoss(
+        alpha=alpha,
+        gamma=train_cfg.get("focal_gamma", 2.0)
+    ).to(device)
 
     # --- Scheduler ---
     epochs = train_cfg["epochs"]
@@ -405,7 +153,7 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup, eta_min=1e-7)
 
     # --- Mixed precision ---
-    scaler = GradScaler() if train_cfg.get("mixed_precision") and device.type == "cuda" else None
+    scaler = GradScaler(device_type="cuda") if train_cfg.get("mixed_precision") and device.type == "cuda" else None
 
     # --- Early stopping on AUPRC (better for imbalanced data) ---
     early_stopping = EarlyStopping(
@@ -426,8 +174,9 @@ def main():
     logger.info("\n" + "=" * 70)
     logger.info("TRAINING START")
     logger.info("=" * 70)
-    logger.info(f"Loss: FocalLoss(gamma=2.0) | Sampler: WeightedRandomSampler")
+    logger.info(f"Loss: FocalLoss(gamma={train_cfg.get('focal_gamma', 2.0)}) | Sampler: WeightedRandomSampler")
     logger.info(f"Backbone frozen: {model_cfg.get('freeze_backbone', True)}")
+    logger.info(f"Unfreeze after epoch: {model_cfg.get('unfreeze_after_epoch', 3)}")
 
     training_history = []
 
@@ -437,7 +186,7 @@ def main():
         # Maybe unfreeze backbone
         model.maybe_unfreeze(epoch)
 
-        # Train
+        # Train (using train_one_epoch from training_utils.py)
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, criterion, device, scaler
         )
@@ -473,6 +222,7 @@ def main():
             "val_f1": val_metrics["f1"],
             "val_auc": val_metrics["auc"],
             "val_auprc": val_metrics["auprc"],
+            "val_optimal_threshold": val_metrics["optimal_threshold"],
             "val_f1_at_optimal": val_metrics["f1_at_optimal"],
             "val_max_f1": val_metrics["max_f1"],
             "val_max_auprc": val_metrics["max_auprc"],
@@ -528,7 +278,9 @@ def main():
 
     # Save results
     results = {
-        "test_metrics": {k: float(v) for k, v in test_metrics.items()},
+        "test_metrics": {k: float(v) if isinstance(v, (int, float, np.floating, np.integer)) else v 
+                         for k, v in test_metrics.items() 
+                         if not isinstance(v, dict)},
         "best_val_auprc": float(best_val_auprc),
         "training_history": training_history,
         "config": config,

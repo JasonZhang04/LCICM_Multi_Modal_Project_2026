@@ -14,9 +14,9 @@ model:
   backbone: "panecho"
   clip_len: 16
   freeze_backbone: true            # freeze initially, unfreeze after warmup
-  unfreeze_after_epoch: 3          # unfreeze backbone after 3 epochs of head-only training
+  unfreeze_after_epoch: 9999       # effectively never unfreeze — dataset too small for backbone fine-tuning
   hidden_dim: 256
-  dropout: 0.3
+  dropout: 0.5
 
 # --- Label Settings ---
 labels:
@@ -39,9 +39,9 @@ training:
   epochs: 30
   learning_rate: 5.0e-4            # head learning rate
   backbone_lr: 5.0e-6              # backbone learning rate (100x smaller)
-  weight_decay: 1.0e-5
+  weight_decay: 1.0e-2
   scheduler: "cosine"
-  warmup_epochs: 3                 # match unfreeze_after_epoch
+  warmup_epochs: 0                 # no warmup needed — backbone stays frozen throughout
   focal_gamma: 2.0                 # focal loss focusing parameter
   val_split: 0.15
   test_split: 0.15

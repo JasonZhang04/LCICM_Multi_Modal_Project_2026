@@ -1,6 +1,12 @@
 """
-Training utilities: focal loss, metrics (AUPRC, threshold tuning),
-early stopping, checkpointing, study-level aggregation.
+Training utilities for aortic dilation classification.
+
+Components:
+- FocalLoss: handles class imbalance at the loss level
+- train_one_epoch: clip-level training with balanced sampler
+- evaluate_study_level: study-level eval with mean/max pooling
+- Metrics: AUPRC (primary), AUC, F1, threshold analysis
+- EarlyStopping, checkpointing
 """
 
 import os
@@ -18,8 +24,6 @@ from sklearn.metrics import (
     f1_score,
     roc_auc_score,
     average_precision_score,
-    precision_recall_curve,
-    confusion_matrix,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,63 +35,75 @@ logger = logging.getLogger(__name__)
 
 class FocalLoss(nn.Module):
     """
-    Focal Loss for imbalanced classification.
+    Focal Loss (Lin et al., 2017) for class-imbalanced classification.
 
-    Standard cross-entropy treats all samples equally. With 10:1 class
-    imbalance, the model gets very confident on the majority class, and
-    those easy samples dominate the loss. Focal loss adds a modulating
-    factor (1 - p_t)^gamma that down-weights easy samples and focuses
-    the optimizer on hard, misclassified examples.
+    Combines two mechanisms:
+    1. Alpha weighting: scales loss per class (higher for minority)
+    2. Focal modulation: (1 - p_t)^gamma downweights easy/confident
+       predictions so the model focuses on hard examples
 
-    L_FL = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    L = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    where p_t = predicted probability of the TRUE class.
+
+    For gamma=0, this reduces to standard weighted cross-entropy.
+    For gamma=2 (recommended), a sample the model predicts with 0.9
+    confidence has its loss scaled by (1-0.9)^2 = 0.01, effectively
+    removing it from gradient computation. This forces the model to
+    focus on the uncertain/misclassified samples.
 
     Args:
-        alpha: Class weight tensor of shape (num_classes,). Can be None.
-        gamma: Focusing parameter. Higher = more focus on hard examples.
-               gamma=0 reduces to standard cross-entropy.
-               gamma=2.0 is a good default for medical imaging.
-        reduction: 'mean' or 'sum' or 'none'.
+        gamma: Focusing parameter. 0 = standard CE, 2 = typical.
+        alpha: Class weight tensor of shape (num_classes,), or None.
+               Higher values for minority class increase its importance.
+        reduction: 'mean' (default), 'sum', or 'none'.
     """
 
-    def __init__(self, alpha=None, gamma: float = 2.0, reduction: str = "mean"):
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: torch.Tensor = None,
+        reduction: str = "mean",
+    ):
         super().__init__()
         self.gamma = gamma
         self.reduction = reduction
 
+        # Register alpha as a buffer so it moves to GPU with the model
+        # and doesn't get treated as a trainable parameter
         if alpha is not None:
-            if isinstance(alpha, (list, np.ndarray)):
-                alpha = torch.tensor(alpha, dtype=torch.float32)
-            self.register_buffer("alpha", alpha)
+            self.register_buffer("alpha", alpha.float())
         else:
             self.alpha = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            logits: (B, C) raw model output (before softmax).
-            targets: (B,) integer class labels.
+            logits: (B, C) raw unnormalized scores from model.
+            targets: (B,) integer class labels in [0, C-1].
 
         Returns:
-            Scalar loss.
+            Scalar loss (if reduction='mean' or 'sum') or (B,) tensor.
         """
-        probs = F.softmax(logits, dim=1)  # (B, C)
-        targets_one_hot = F.one_hot(targets, num_classes=logits.size(1)).float()  # (B, C)
+        # Compute standard cross-entropy per sample (no reduction)
+        ce_loss = F.cross_entropy(logits, targets, reduction="none")
 
-        # p_t = probability of the true class
-        p_t = (probs * targets_one_hot).sum(dim=1)  # (B,)
+        # p_t = probability assigned to the TRUE class
+        # We compute it from the CE loss: p_t = exp(-CE_loss)
+        # This is numerically equivalent to softmax + gather but
+        # avoids a redundant softmax computation
+        p_t = torch.exp(-ce_loss)
 
         # Focal modulating factor
-        focal_weight = (1 - p_t) ** self.gamma  # (B,)
+        focal_weight = (1.0 - p_t) ** self.gamma
 
-        # Standard cross-entropy per sample
-        ce_loss = F.cross_entropy(logits, targets, reduction="none")  # (B,)
+        # Apply focal modulation
+        loss = focal_weight * ce_loss
 
-        # Apply focal weight
-        loss = focal_weight * ce_loss  # (B,)
-
-        # Apply class-specific alpha weights
+        # Apply per-class alpha weighting
         if self.alpha is not None:
-            alpha_t = self.alpha[targets]  # (B,)
+            # Gather the alpha for each sample's true class
+            alpha_t = self.alpha[targets]
             loss = alpha_t * loss
 
         if self.reduction == "mean":
@@ -98,124 +114,21 @@ class FocalLoss(nn.Module):
 
 
 # ------------------------------------------------------------------ #
-#  Metrics                                                             #
-# ------------------------------------------------------------------ #
-
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray = None) -> dict:
-    """
-    Compute classification metrics including AUPRC and optimal threshold.
-
-    For imbalanced medical data, AUPRC is more informative than AUROC
-    because it focuses on the model's ability to correctly identify
-    positive cases without being inflated by the large number of easy
-    negatives.
-    """
-    metrics = {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, average="binary", zero_division=0),
-        "recall": recall_score(y_true, y_pred, average="binary", zero_division=0),
-        "f1": f1_score(y_true, y_pred, average="binary", zero_division=0),
-    }
-
-    if y_prob is not None and len(np.unique(y_true)) > 1:
-        try:
-            metrics["auc"] = roc_auc_score(y_true, y_prob)
-        except ValueError:
-            metrics["auc"] = 0.0
-
-        try:
-            # AUPRC — more informative for imbalanced data
-            metrics["auprc"] = average_precision_score(y_true, y_prob)
-        except ValueError:
-            metrics["auprc"] = 0.0
-
-        try:
-            # Find optimal threshold from precision-recall curve
-            # Maximize F1 = 2 * (precision * recall) / (precision + recall)
-            precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
-            f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
-            optimal_idx = np.argmax(f1_scores)
-            metrics["optimal_threshold"] = float(thresholds[min(optimal_idx, len(thresholds) - 1)])
-            metrics["f1_at_optimal"] = float(f1_scores[optimal_idx])
-        except (ValueError, IndexError):
-            metrics["optimal_threshold"] = 0.5
-            metrics["f1_at_optimal"] = 0.0
-
-    return metrics
-
-
-def compute_metrics_at_threshold(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> dict:
-    """Compute metrics using a custom probability threshold instead of 0.5."""
-    y_pred = (y_prob >= threshold).astype(int)
-    return {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, average="binary", zero_division=0),
-        "recall": recall_score(y_true, y_pred, average="binary", zero_division=0),
-        "f1": f1_score(y_true, y_pred, average="binary", zero_division=0),
-        "threshold": threshold,
-    }
-
-
-# ------------------------------------------------------------------ #
-#  Study-level aggregation                                             #
-# ------------------------------------------------------------------ #
-
-def aggregate_study_predictions(
-    accessions: list,
-    probs: np.ndarray,
-    labels: list,
-    method: str = "mean",
-) -> tuple:
-    """
-    Aggregate clip-level predictions to study-level.
-
-    Args:
-        accessions: List of accession strings per clip.
-        probs: Array of shape (N, 2) — softmax probabilities per clip.
-        labels: List of integer labels per clip.
-        method: "mean" (average probs) or "max" (take max positive prob).
-
-    Returns:
-        (study_y_true, study_y_pred, study_y_prob) — arrays at study level.
-    """
-    study_probs = defaultdict(list)
-    study_labels = {}
-
-    for i in range(len(accessions)):
-        acc = accessions[i]
-        study_probs[acc].append(probs[i])
-        study_labels[acc] = labels[i]
-
-    y_true, y_pred, y_prob = [], [], []
-    for acc in study_probs:
-        clip_probs = np.array(study_probs[acc])  # (num_clips, 2)
-
-        if method == "mean":
-            avg_prob = clip_probs.mean(axis=0)
-        elif method == "max":
-            # Max-pooling: take the clip with highest dilated probability
-            # Clinical logic: if ANY view shows dilation, patient is dilated
-            max_idx = clip_probs[:, 1].argmax()
-            avg_prob = clip_probs[max_idx]
-        else:
-            avg_prob = clip_probs.mean(axis=0)
-
-        pred = np.argmax(avg_prob)
-        y_true.append(study_labels[acc])
-        y_pred.append(pred)
-        y_prob.append(avg_prob[1])  # probability of dilated
-
-    return np.array(y_true), np.array(y_pred), np.array(y_prob)
-
-
-# ------------------------------------------------------------------ #
-#  Early stopping                                                      #
+#  Early Stopping                                                      #
 # ------------------------------------------------------------------ #
 
 class EarlyStopping:
-    """Stop training when validation metric stops improving."""
+    """
+    Stop training when a monitored metric stops improving.
 
-    def __init__(self, patience: int = 7, mode: str = "min", min_delta: float = 1e-4):
+    Args:
+        patience: Number of epochs with no improvement before stopping.
+        mode: 'max' if higher metric is better (e.g., AUPRC),
+              'min' if lower is better (e.g., loss).
+        min_delta: Minimum change to count as improvement.
+    """
+
+    def __init__(self, patience: int = 7, mode: str = "max", min_delta: float = 1e-4):
         self.patience = patience
         self.mode = mode
         self.min_delta = min_delta
@@ -228,11 +141,10 @@ class EarlyStopping:
             self.best_score = score
             return False
 
-        improved = (
-            (score < self.best_score - self.min_delta)
-            if self.mode == "min"
-            else (score > self.best_score + self.min_delta)
-        )
+        if self.mode == "max":
+            improved = score > self.best_score + self.min_delta
+        else:
+            improved = score < self.best_score - self.min_delta
 
         if improved:
             self.best_score = score
@@ -241,9 +153,278 @@ class EarlyStopping:
             self.counter += 1
             if self.counter >= self.patience:
                 self.should_stop = True
-                logger.info(f"Early stopping triggered (patience={self.patience})")
+                logger.info(
+                    f"Early stopping: no improvement for {self.patience} epochs "
+                    f"(best={self.best_score:.4f})"
+                )
 
         return self.should_stop
+
+
+# ------------------------------------------------------------------ #
+#  Metrics                                                             #
+# ------------------------------------------------------------------ #
+
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray = None,
+) -> dict:
+    """
+    Compute classification metrics.
+
+    Args:
+        y_true: (N,) ground truth binary labels.
+        y_pred: (N,) predicted binary labels (at some threshold).
+        y_prob: (N,) predicted probability of class 1. Optional.
+
+    Returns:
+        Dict with accuracy, precision, recall, f1, and optionally
+        auc and auprc.
+    """
+    metrics = {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+    }
+
+    if y_prob is not None and len(np.unique(y_true)) > 1:
+        try:
+            metrics["auc"] = float(roc_auc_score(y_true, y_prob))
+        except ValueError:
+            metrics["auc"] = 0.0
+        try:
+            # AUPRC is our primary metric for imbalanced data
+            # A random classifier scores ~prevalence (e.g., 0.08)
+            # so anything above that indicates learning
+            metrics["auprc"] = float(average_precision_score(y_true, y_prob))
+        except ValueError:
+            metrics["auprc"] = 0.0
+    elif y_prob is not None:
+        # Only one class present in this split — can't compute AUC
+        metrics["auc"] = 0.0
+        metrics["auprc"] = 0.0
+
+    return metrics
+
+
+def threshold_analysis(y_true: np.ndarray, y_prob: np.ndarray) -> dict:
+    """
+    Show model performance at multiple probability thresholds.
+
+    The default 0.5 threshold may be too high. The model might be
+    assigning 0.2-0.4 probability to dilated cases, which is a
+    real signal but doesn't cross 0.5.
+
+    Returns:
+        Dict mapping threshold string -> metrics dict.
+    """
+    if len(np.unique(y_true)) < 2:
+        return {}
+
+    results = {}
+    for threshold in [0.1, 0.2, 0.3, 0.4, 0.5]:
+        y_pred = (y_prob >= threshold).astype(int)
+        n_pred_pos = int(y_pred.sum())
+        n_actual_pos = int(y_true.sum())
+
+        results[f"t{threshold:.1f}"] = {
+            "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+            "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+            "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+            "n_predicted_pos": n_pred_pos,
+            "n_actual_pos": n_actual_pos,
+        }
+    return results
+
+
+# ------------------------------------------------------------------ #
+#  Training loop                                                       #
+# ------------------------------------------------------------------ #
+
+def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
+    """
+    Train for one epoch at clip level.
+
+    With WeightedRandomSampler, each batch has roughly 50/50 class
+    balance. Combined with focal loss, the model gets a strong,
+    balanced gradient signal from both classes.
+    """
+    model.train()
+    total_loss = 0.0
+    n_samples = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    for batch in loader:
+        video = batch["video"].to(device)    # (B, C, T, H, W)
+        labels = batch["label"].to(device)   # (B,)
+
+        optimizer.zero_grad()
+
+        if scaler is not None:
+            with torch.amp.autocast("cuda"):
+                logits = model(video)
+                loss = criterion(logits, labels)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(video)
+            loss = criterion(logits, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+        bs = video.size(0)
+        total_loss += loss.item() * bs
+        n_samples += bs
+
+        probs = torch.softmax(logits.detach(), dim=1)
+        preds = probs.argmax(dim=1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs[:, 1].cpu().numpy())
+
+    y_true = np.array(all_labels)
+    y_pred = np.array(all_preds)
+    y_prob = np.array(all_probs)
+
+    avg_loss = total_loss / max(n_samples, 1)
+    metrics = compute_metrics(y_true, y_pred, y_prob)
+    metrics["loss"] = avg_loss
+
+    return metrics
+
+
+# ------------------------------------------------------------------ #
+#  Study-level evaluation                                              #
+# ------------------------------------------------------------------ #
+
+@torch.no_grad()
+def evaluate_study_level(model, loader, criterion, device):
+    """
+    Evaluate at the STUDY level with two aggregation strategies.
+
+    For each study, we collect the predicted P(dilated) from every
+    clip, then aggregate:
+
+    1. MEAN pooling: average P(dilated) across all clips.
+       Represents the "overall impression" from the full study.
+
+    2. MAX pooling: take the highest P(dilated) across all clips.
+       Clinically motivated: aortic dilation is visible in specific
+       views (mainly PLAX). If ANY clip shows high probability,
+       the study should be flagged. This is more appropriate for
+       a screening setting where sensitivity matters.
+
+    We report full metrics for both strategies plus threshold analysis.
+    """
+    model.eval()
+    total_loss = 0.0
+    n_clips = 0
+
+    # Collect per-clip probabilities grouped by study
+    study_clip_probs = defaultdict(list)  # accession -> list of P(dilated)
+    study_labels = {}                     # accession -> ground truth label
+
+    for batch in loader:
+        video = batch["video"].to(device)
+        labels = batch["label"].to(device)
+        accessions = batch["accession"]
+
+        logits = model(video)
+        loss = criterion(logits, labels)
+
+        total_loss += loss.item() * video.size(0)
+        n_clips += video.size(0)
+
+        # Get P(dilated) = softmax probability of class 1
+        probs = torch.softmax(logits, dim=1)  # (B, 2)
+        prob_dilated = probs[:, 1].cpu().numpy()  # (B,)
+
+        for i in range(len(accessions)):
+            acc = accessions[i]
+            study_clip_probs[acc].append(prob_dilated[i])
+            study_labels[acc] = labels[i].cpu().item()
+
+    # --- Aggregate per study ---
+    y_true = []
+    y_prob_mean = []
+    y_prob_max = []
+
+    for acc in study_clip_probs:
+        clip_probs = np.array(study_clip_probs[acc])  # (N_clips,)
+        label = study_labels[acc]
+
+        y_true.append(label)
+        y_prob_mean.append(float(np.mean(clip_probs)))
+        y_prob_max.append(float(np.max(clip_probs)))
+
+    y_true = np.array(y_true, dtype=int)
+    y_prob_mean = np.array(y_prob_mean)
+    y_prob_max = np.array(y_prob_max)
+
+    # --- Mean pooling metrics ---
+    y_pred_mean = (y_prob_mean >= 0.5).astype(int)
+    metrics_mean = compute_metrics(y_true, y_pred_mean, y_prob_mean)
+
+    # --- Max pooling metrics ---
+    y_pred_max = (y_prob_max >= 0.5).astype(int)
+    metrics_max = compute_metrics(y_true, y_pred_max, y_prob_max)
+
+    # --- Threshold analysis for both strategies ---
+    thresh_mean = threshold_analysis(y_true, y_prob_mean)
+    thresh_max = threshold_analysis(y_true, y_prob_max)
+
+    # --- Find optimal threshold for mean pooling ---
+    optimal_thresh, f1_at_opt = find_optimal_threshold(y_true, y_prob_mean)
+
+    # --- Combine into result dict ---
+    # Primary metrics use mean pooling
+    result = {
+        "loss": total_loss / max(n_clips, 1),
+        "n_studies": len(study_clip_probs),
+        "n_clips": n_clips,
+
+        # Mean pooling metrics
+        "accuracy": metrics_mean["accuracy"],
+        "precision": metrics_mean["precision"],
+        "recall": metrics_mean["recall"],
+        "f1": metrics_mean["f1"],
+        "auc": metrics_mean.get("auc", 0.0),
+        "auprc": metrics_mean.get("auprc", 0.0),
+
+        # Max pooling metrics (prefixed with max_)
+        "max_accuracy": metrics_max["accuracy"],
+        "max_precision": metrics_max["precision"],
+        "max_recall": metrics_max["recall"],
+        "max_f1": metrics_max["f1"],
+        "max_auc": metrics_max.get("auc", 0.0),
+        "max_auprc": metrics_max.get("auprc", 0.0),
+
+        # Threshold analysis
+        "threshold_mean": thresh_mean,
+        "threshold_max": thresh_max,
+
+        # Optimal threshold metrics
+        "optimal_threshold": optimal_thresh,
+        "f1_at_optimal": f1_at_opt,
+
+        # Raw probabilities for debugging
+        "prob_mean_stats": {
+            "min": float(y_prob_mean.min()) if len(y_prob_mean) > 0 else 0,
+            "max": float(y_prob_mean.max()) if len(y_prob_mean) > 0 else 0,
+            "median": float(np.median(y_prob_mean)) if len(y_prob_mean) > 0 else 0,
+            "mean": float(y_prob_mean.mean()) if len(y_prob_mean) > 0 else 0,
+        },
+    }
+
+    return result
 
 
 # ------------------------------------------------------------------ #
@@ -258,7 +439,10 @@ def save_checkpoint(model, optimizer, epoch, metrics, path):
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "metrics": metrics,
+            "metrics": {
+                k: v for k, v in metrics.items()
+                if not isinstance(v, dict)  # skip nested dicts for clean serialization
+            },
         },
         path,
     )
@@ -277,11 +461,128 @@ def load_checkpoint(model, optimizer, path, device):
 
 
 def format_metrics(metrics: dict, prefix: str = "") -> str:
-    """Format metrics dict into a readable string."""
+    """Format metrics dict into a readable log string."""
     parts = []
     for k, v in metrics.items():
         if isinstance(v, float):
             parts.append(f"{prefix}{k}: {v:.4f}")
-        else:
+        elif isinstance(v, (int, np.integer)):
             parts.append(f"{prefix}{k}: {v}")
     return " | ".join(parts)
+
+
+# ------------------------------------------------------------------ #
+#  Missing functions needed by 03_train.py                            #
+# ------------------------------------------------------------------ #
+
+def compute_metrics_at_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    threshold: float,
+) -> dict:
+    """
+    Compute classification metrics at a specific probability threshold.
+
+    Args:
+        y_true: (N,) ground truth binary labels.
+        y_prob: (N,) predicted probability of class 1.
+        threshold: Decision threshold for converting probabilities to predictions.
+
+    Returns:
+        Dict with precision, recall, f1 at the given threshold.
+    """
+    y_pred = (y_prob >= threshold).astype(int)
+    return {
+        "threshold": threshold,
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+    }
+
+
+def find_optimal_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    thresholds: np.ndarray = None,
+) -> tuple:
+    """
+    Find the probability threshold that maximizes F1 score.
+
+    Args:
+        y_true: (N,) ground truth binary labels.
+        y_prob: (N,) predicted probability of class 1.
+        thresholds: Array of thresholds to try. Defaults to 0.1 to 0.9.
+
+    Returns:
+        (best_threshold, best_f1)
+    """
+    if thresholds is None:
+        thresholds = np.arange(0.1, 0.91, 0.05)
+
+    best_f1 = 0.0
+    best_thresh = 0.5
+
+    for thresh in thresholds:
+        y_pred = (y_prob >= thresh).astype(int)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thresh = thresh
+
+    return float(best_thresh), float(best_f1)
+
+
+def aggregate_study_predictions(
+    accessions: list,
+    probs: np.ndarray,
+    labels: list,
+    method: str = "mean",
+) -> tuple:
+    """
+    Aggregate clip-level predictions to study level.
+
+    Args:
+        accessions: List of accession IDs (one per clip).
+        probs: (N, 2) array of class probabilities, or (N,) array of P(class=1).
+        labels: List of ground truth labels (one per clip).
+        method: "mean" or "max" pooling of P(dilated).
+
+    Returns:
+        (y_true, y_pred, y_prob) arrays at study level.
+    """
+    # Handle both (N, 2) and (N,) probability formats
+    probs = np.array(probs)
+    if probs.ndim == 2:
+        prob_positive = probs[:, 1]  # P(dilated)
+    else:
+        prob_positive = probs
+
+    # Group by accession
+    study_probs = defaultdict(list)
+    study_labels = {}
+
+    for i, acc in enumerate(accessions):
+        study_probs[acc].append(prob_positive[i])
+        study_labels[acc] = int(labels[i])
+
+    # Aggregate
+    y_true = []
+    y_prob = []
+
+    for acc in study_probs:
+        clip_probs = np.array(study_probs[acc])
+
+        if method == "max":
+            agg_prob = float(np.max(clip_probs))
+        else:  # mean
+            agg_prob = float(np.mean(clip_probs))
+
+        y_true.append(study_labels[acc])
+        y_prob.append(agg_prob)
+
+    y_true = np.array(y_true, dtype=int)
+    y_prob = np.array(y_prob)
+    y_pred = (y_prob >= 0.5).astype(int)
+
+    return y_true, y_pred, y_prob
