@@ -26,7 +26,7 @@ import torch
 sys.path.insert(0, os.path.dirname(__file__))
 
 from multimodal_aorta.configs.default_config import Config
-from multimodal_aorta.data.dataset import build_cohort, AortaDataset
+from multimodal_aorta.data.dataset import build_cohort, AortaDataset, compute_target_stats
 from multimodal_aorta.data.splits import make_splits
 from multimodal_aorta.data.preprocessing import load_ecg, load_cxr, collate_fn
 from multimodal_aorta.models.full_model import AortaModel
@@ -45,6 +45,14 @@ def parse_args():
     p.add_argument("--ecg_encoder",      type=str,   default=None,
                    choices=["resnet1d", "ecgfm"],
                    help="ECG encoder backend (resnet1d=baseline, ecgfm=future)")
+    p.add_argument("--ecg_pretrain_ckpt", type=str,  default=None,
+                   help="Path to SimCLR-pretrained ECG encoder weights (from pretrain_ecg.py)")
+    p.add_argument("--pclr_embeddings",  type=str,  default=None,
+                   help="Path to PCLR embeddings .pt file (from scripts/extract_pclr_embeddings.py). "
+                        "Automatically sets ecg_encoder=pclr_frozen.")
+    p.add_argument("--cxr_embeddings",   type=str,  default=None,
+                   help="Path to RAD-DINO embeddings .pt file (from scripts/extract_raddino_embeddings.py). "
+                        "Automatically sets cxr_encoder=raddino_frozen (frozen precomputed CXR features).")
 
     # Resume
     p.add_argument("--resume",           type=str,   default=None,
@@ -66,7 +74,14 @@ def main():
     if args.num_epochs    is not None: cfg.train.num_epochs    = args.num_epochs
     if args.max_days_offset is not None: cfg.data.max_days_offset = args.max_days_offset
     if args.output_dir    is not None: cfg.train.output_dir    = args.output_dir
-    if args.ecg_encoder   is not None: cfg.model.ecg_encoder   = args.ecg_encoder
+    if args.ecg_encoder       is not None: cfg.model.ecg_encoder       = args.ecg_encoder
+    if args.ecg_pretrain_ckpt is not None: cfg.model.ecg_pretrain_ckpt = args.ecg_pretrain_ckpt
+    if args.pclr_embeddings   is not None:
+        cfg.data.pclr_embeddings_path = args.pclr_embeddings
+        cfg.model.ecg_encoder = "pclr_frozen"
+    if args.cxr_embeddings    is not None:
+        cfg.data.cxr_embeddings_path = args.cxr_embeddings
+        cfg.model.cxr_encoder = "raddino_frozen"
 
     if args.debug:
         cfg.train.num_epochs          = 2
@@ -111,15 +126,52 @@ def main():
 
     log.info("Cohort splits — train: %d  val: %d  test: %d", len(train_ids), len(val_ids), len(test_ids))
 
+    # --- Target normalization (Step 1) ---
+    # Compute z-score stats on the TRAIN split only, then apply to all splits
+    # in the dataset's __getitem__. evaluate() de-normalizes predictions to cm
+    # before reporting MAE/R²/AUROC.
+    target_stats = None
+    if cfg.data.target_normalize:
+        train_cohort = cohort[cohort["subject_id"].isin(train_ids)].reset_index(drop=True)
+        target_stats = compute_target_stats(train_cohort)
+        log.info(
+            "Target stats (train split, cm) — root: mean=%.4f std=%.4f | asc: mean=%.4f std=%.4f",
+            target_stats.root_mean, target_stats.root_std,
+            target_stats.asc_mean,  target_stats.asc_std,
+        )
+
+    # --- PCLR precomputed embeddings (optional) ---
+    ecg_embeddings = None
+    if cfg.data.pclr_embeddings_path:
+        from multimodal_aorta.models.ecg_encoder import PCLREmbeddingEncoder
+        ecg_embeddings = PCLREmbeddingEncoder.load_embeddings(cfg.data.pclr_embeddings_path)
+        log.info(
+            "PCLR embeddings loaded: %d subjects — ecg_encoder set to 'pclr_frozen'",
+            len(ecg_embeddings),
+        )
+
+    # --- RAD-DINO precomputed CXR embeddings (optional) ---
+    cxr_embeddings = None
+    if cfg.data.cxr_embeddings_path:
+        from multimodal_aorta.models.cxr_encoder import CXREmbeddingEncoder
+        cxr_embeddings = CXREmbeddingEncoder.load_embeddings(cfg.data.cxr_embeddings_path)
+        log.info(
+            "RAD-DINO embeddings loaded: %d subjects — cxr_encoder set to 'raddino_frozen'",
+            len(cxr_embeddings),
+        )
+
     def make_subset(ids, is_train):
         sub = cohort[cohort["subject_id"].isin(ids)].reset_index(drop=True)
         return AortaDataset(
             sub,
-            ecg_transform = load_ecg,
-            cxr_transform = load_cxr,
-            ecg_cfg       = cfg.data,
-            cxr_cfg       = cfg.data,
-            is_train      = is_train,
+            ecg_transform  = load_ecg,
+            cxr_transform  = load_cxr,
+            ecg_cfg        = cfg.data,
+            cxr_cfg        = cfg.data,
+            is_train       = is_train,
+            target_stats   = target_stats,
+            ecg_embeddings = ecg_embeddings,
+            cxr_embeddings = cxr_embeddings,
         )
 
     train_ds = make_subset(train_ids, is_train=True)
@@ -163,7 +215,12 @@ def main():
     # --- Train ---
     # Always auto-detect device (uses GPU if available, CPU otherwise).
     # debug mode only changes epochs/batch_size, not the device.
-    train(model, train_loader, val_loader, cfg, output_dir=cfg.train.output_dir, device=None)
+    train(
+        model, train_loader, val_loader, cfg,
+        output_dir=cfg.train.output_dir,
+        device=None,
+        target_stats=target_stats,
+    )
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from multimodal_aorta.data.dataset import TargetStats
 from multimodal_aorta.training.losses import total_loss
 
 # Dilation threshold (cm) — used for AUROC classification
@@ -129,30 +130,45 @@ def evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
-    huber_delta: float = 0.5,
+    target_stats: Optional[TargetStats] = None,
     force_ecg_only: bool = False,
     force_cxr_only: bool = False,
+    restrict_to_both: bool = False,
 ) -> EvalMetrics:
     """
     Run one full evaluation pass over `loader`.
+
+    The loader yields batches whose `target` tensor is in the SAME scale the
+    model was trained on (z-scored when `target_stats` is provided). The loss
+    reported here is therefore in that same scale (z-score MSE) for direct
+    comparison with `train_loss`. Predictions and targets are de-normalized to
+    cm before MAE / RMSE / R² / Pearson / AUROC are computed, so reported
+    regression metrics are always in human-readable cm.
 
     Args:
         model:          AortaModel in eval mode
         loader:         DataLoader yielding collated batches
         device:         torch device
-        huber_delta:    Huber delta for loss computation
+        target_stats:   if provided, used to de-normalize predictions/targets
+                        back to cm before metric computation
         force_ecg_only: override has_cxr=False for all samples (ablation)
         force_cxr_only: override has_ecg=False for all samples (ablation)
+        restrict_to_both: compute metrics ONLY over samples that genuinely have
+                        BOTH modalities present (before any ablation override).
+                        This is required to measure each modality's marginal
+                        contribution honestly: on a cohort dominated by
+                        ECG-only patients, a whole-set 'cxr_only' pass mostly
+                        measures the model's mean-prediction (both tokens
+                        masked), not what CXR can actually do. See module docstring.
 
     Returns:
         EvalMetrics dataclass with all computed metrics
     """
     model.eval()
 
-    all_preds  = []   # list of (B, 2) tensors
+    all_preds   = []  # list of (B, 2) tensors
     all_targets = []  # list of (B, 2) tensors
-    total_val_loss = 0.0
-    n_batches = 0
+    all_both    = []  # list of (B,) bool tensors — sample genuinely has both modalities
 
     for batch in loader:
         ecg     = batch["ecg"].to(device)
@@ -160,6 +176,9 @@ def evaluate(
         target  = batch["target"].to(device)
         has_ecg = batch["has_ecg"].to(device)
         has_cxr = batch["has_cxr"].to(device)
+
+        # Record TRUE modality availability before any ablation override.
+        both = (has_ecg & has_cxr).cpu()
 
         # Ablation overrides
         if force_ecg_only:
@@ -169,21 +188,38 @@ def evaluate(
 
         pred = model(ecg, cxr, has_ecg, has_cxr)
 
-        loss = total_loss(pred, target, delta=huber_delta)
-        total_val_loss += loss.item()
-        n_batches += 1
-
         all_preds.append(pred.cpu())
         all_targets.append(target.cpu())
+        all_both.append(both)
 
-    preds   = torch.cat(all_preds,   dim=0).numpy()   # (N, 2)
-    targets = torch.cat(all_targets, dim=0).numpy()   # (N, 2)
+    preds_t   = torch.cat(all_preds,   dim=0)         # (N, 2)
+    targets_t = torch.cat(all_targets, dim=0)         # (N, 2)
+    both_mask = torch.cat(all_both,    dim=0)         # (N,)
+
+    if restrict_to_both:
+        preds_t   = preds_t[both_mask]
+        targets_t = targets_t[both_mask]
+
+    # Loss is reported in the SAME (z-scored) scale as train_loss, computed over
+    # whatever subset we are evaluating, for direct comparability.
+    if preds_t.shape[0] > 0:
+        val_loss = float(total_loss(preds_t, targets_t).item())
+    else:
+        val_loss = float("nan")
+
+    # De-normalize back to cm for human-readable metrics. NaN targets stay NaN.
+    if target_stats is not None:
+        preds_t   = target_stats.denormalize(preds_t)
+        targets_t = target_stats.denormalize(targets_t)
+
+    preds   = preds_t.numpy()
+    targets = targets_t.numpy()
 
     root_m = _compute_target_metrics(preds[:, 0], targets[:, 0])
     asc_m  = _compute_target_metrics(preds[:, 1], targets[:, 1])
 
     return EvalMetrics(
-        val_loss    = total_val_loss / max(n_batches, 1),
+        val_loss    = val_loss,
         mae_root    = root_m["mae"],
         mae_asc     = asc_m["mae"],
         rmse_root   = root_m["rmse"],
@@ -201,7 +237,8 @@ def evaluate_ablation(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
-    huber_delta: float = 0.5,
+    target_stats: Optional[TargetStats] = None,
+    restrict_to_both: bool = False,
 ) -> Dict[str, EvalMetrics]:
     """
     Run three evaluation passes for per-modality ablation:
@@ -209,10 +246,77 @@ def evaluate_ablation(
       'ecg_only' — ECG only (CXR replaced with mask token)
       'cxr_only' — CXR only (ECG replaced with mask token)
 
+    When `restrict_to_both=True`, all three passes are scored ONLY on the
+    subset of patients that genuinely have both modalities, so the numbers are
+    directly comparable and 'cxr_only' actually measures CXR's standalone
+    signal (rather than mean-prediction on ECG-only patients).
+
     Returns a dict keyed by ablation name.
     """
     return {
-        "both":     evaluate(model, loader, device, huber_delta),
-        "ecg_only": evaluate(model, loader, device, huber_delta, force_ecg_only=True),
-        "cxr_only": evaluate(model, loader, device, huber_delta, force_cxr_only=True),
+        "both":     evaluate(model, loader, device, target_stats=target_stats,
+                             restrict_to_both=restrict_to_both),
+        "ecg_only": evaluate(model, loader, device, target_stats=target_stats,
+                             force_ecg_only=True, restrict_to_both=restrict_to_both),
+        "cxr_only": evaluate(model, loader, device, target_stats=target_stats,
+                             force_cxr_only=True, restrict_to_both=restrict_to_both),
     }
+
+
+@torch.no_grad()
+def evaluate_mean_baseline(
+    loader: DataLoader,
+    target_stats: Optional[TargetStats] = None,
+    restrict_to_both: bool = False,
+) -> EvalMetrics:
+    """
+    Constant-predictor reference: always predict the train-split mean diameter.
+
+    This is the honest "do-nothing" baseline any model must beat. Because the
+    model trains on z-scored targets, the train mean corresponds to a prediction
+    of 0 in z-scored space (de-normalized back to root_mean / asc_mean in cm).
+    R² of this predictor is ~0 by construction; its MAE is the bar to clear.
+
+    No model is needed — we only read targets from the loader.
+    """
+    all_targets = []
+    all_both    = []
+
+    for batch in loader:
+        target  = batch["target"]
+        has_ecg = batch["has_ecg"]
+        has_cxr = batch["has_cxr"]
+        all_targets.append(target)
+        all_both.append((has_ecg & has_cxr))
+
+    targets_t = torch.cat(all_targets, dim=0)          # (N, 2), z-scored if stats given
+    both_mask = torch.cat(all_both,    dim=0)          # (N,)
+
+    if restrict_to_both:
+        targets_t = targets_t[both_mask]
+
+    # Predict the mean → 0 in z-scored space (train mean in cm after de-norm).
+    preds_t = torch.zeros_like(targets_t)
+
+    if target_stats is not None:
+        preds_t   = target_stats.denormalize(preds_t)
+        targets_t = target_stats.denormalize(targets_t)
+
+    preds   = preds_t.numpy()
+    targets = targets_t.numpy()
+
+    root_m = _compute_target_metrics(preds[:, 0], targets[:, 0])
+    asc_m  = _compute_target_metrics(preds[:, 1], targets[:, 1])
+
+    return EvalMetrics(
+        mae_root    = root_m["mae"],
+        mae_asc     = asc_m["mae"],
+        rmse_root   = root_m["rmse"],
+        rmse_asc    = asc_m["rmse"],
+        r2_root     = root_m["r2"],
+        r2_asc      = asc_m["r2"],
+        pearson_root = root_m["pearson"],
+        pearson_asc  = asc_m["pearson"],
+        auroc_root  = root_m["auroc"],
+        auroc_asc   = asc_m["auroc"],
+    )

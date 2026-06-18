@@ -9,6 +9,7 @@ image loading happens in __getitem__ via the preprocessing module.
 """
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -18,6 +19,63 @@ import torch
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Target normalization (Step 1 redesign)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TargetStats:
+    """Per-target mean and std (cm), computed on the train split only."""
+    root_mean: float
+    root_std: float
+    asc_mean: float
+    asc_std: float
+
+    def normalize(self, target: torch.Tensor) -> torch.Tensor:
+        """Z-score a (..., 2) tensor of [root, asc] values. Preserves NaN."""
+        means = torch.tensor([self.root_mean, self.asc_mean], dtype=target.dtype)
+        stds = torch.tensor([self.root_std, self.asc_std], dtype=target.dtype)
+        means = means.to(target.device)
+        stds = stds.to(target.device)
+        return (target - means) / stds
+
+    def denormalize(self, target: torch.Tensor) -> torch.Tensor:
+        """Inverse of normalize(): map z-scored values back to cm."""
+        means = torch.tensor([self.root_mean, self.asc_mean], dtype=target.dtype)
+        stds = torch.tensor([self.root_std, self.asc_std], dtype=target.dtype)
+        means = means.to(target.device)
+        stds = stds.to(target.device)
+        return target * stds + means
+
+
+def compute_target_stats(cohort: pd.DataFrame) -> TargetStats:
+    """
+    Compute z-score statistics on the train cohort.
+
+    NaN entries are ignored (each target's mean/std is computed over its own
+    non-null values). The cohort is expected to have already been QC-clipped
+    and renamed to use the `target_root` / `target_asc` columns.
+    """
+    root = cohort["target_root"].to_numpy(dtype=np.float64)
+    asc = cohort["target_asc"].to_numpy(dtype=np.float64)
+
+    root_valid = root[~np.isnan(root)]
+    asc_valid = asc[~np.isnan(asc)]
+
+    if len(root_valid) < 2 or len(asc_valid) < 2:
+        raise ValueError(
+            f"Not enough valid targets to compute stats "
+            f"(root n={len(root_valid)}, asc n={len(asc_valid)})"
+        )
+
+    return TargetStats(
+        root_mean=float(root_valid.mean()),
+        root_std=float(root_valid.std(ddof=0)),
+        asc_mean=float(asc_valid.mean()),
+        asc_std=float(asc_valid.std(ddof=0)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +641,9 @@ class AortaDataset(Dataset):
         ecg_cfg=None,
         cxr_cfg=None,
         is_train: bool = False,
+        target_stats: Optional[TargetStats] = None,
+        ecg_embeddings: Optional[Dict[int, torch.Tensor]] = None,
+        cxr_embeddings: Optional[Dict[int, torch.Tensor]] = None,
     ):
         """
         Parameters
@@ -592,6 +653,17 @@ class AortaDataset(Dataset):
         cxr_transform : callable(path, is_train) -> (3, H, W) float32 tensor
         ecg_cfg / cxr_cfg : DataConfig fields (passed through to transforms)
         is_train : controls augmentation in cxr_transform
+        target_stats : when provided, targets returned by __getitem__ are
+                       z-scored using these stats (computed on the train split).
+                       NaN target entries are preserved.
+        ecg_embeddings : optional {subject_id: tensor(320,)} dict of precomputed
+                         PCLR embeddings. When provided, __getitem__ returns the
+                         precomputed embedding as `ecg` instead of loading the raw
+                         waveform. ecg_transform is ignored in this mode.
+        cxr_embeddings : optional {subject_id: tensor(768,)} dict of precomputed
+                         RAD-DINO embeddings. When provided, __getitem__ returns
+                         the precomputed embedding as `cxr` instead of loading the
+                         raw image. cxr_transform is ignored in this mode.
         """
         self.cohort = cohort.reset_index(drop=True)
         self.ecg_transform = ecg_transform
@@ -599,6 +671,9 @@ class AortaDataset(Dataset):
         self.ecg_cfg = ecg_cfg
         self.cxr_cfg = cxr_cfg
         self.is_train = is_train
+        self.target_stats = target_stats
+        self.ecg_embeddings = ecg_embeddings  # {int subject_id: tensor(320,)} or None
+        self.cxr_embeddings = cxr_embeddings  # {int subject_id: tensor(768,)} or None
 
     def __len__(self) -> int:
         return len(self.cohort)
@@ -608,7 +683,17 @@ class AortaDataset(Dataset):
 
         # ---- ECG ----
         has_ecg = bool(row["has_ecg"])
-        if has_ecg and self.ecg_transform is not None:
+        subject_id = int(row["subject_id"])
+
+        if self.ecg_embeddings is not None:
+            # PCLR mode: return precomputed 320-dim embedding
+            if subject_id in self.ecg_embeddings:
+                ecg = self.ecg_embeddings[subject_id].float()
+                has_ecg = True
+            else:
+                ecg = torch.zeros(320, dtype=torch.float32)
+                has_ecg = False
+        elif has_ecg and self.ecg_transform is not None:
             try:
                 ecg = self.ecg_transform(row["ecg_path"], self.ecg_cfg)
             except Exception as e:
@@ -621,7 +706,15 @@ class AortaDataset(Dataset):
 
         # ---- CXR ----
         has_cxr = bool(row["has_cxr"])
-        if has_cxr and self.cxr_transform is not None:
+        if self.cxr_embeddings is not None:
+            # RAD-DINO frozen mode: return precomputed 768-dim embedding
+            if subject_id in self.cxr_embeddings:
+                cxr = self.cxr_embeddings[subject_id].float()
+                has_cxr = True
+            else:
+                cxr = torch.zeros(768, dtype=torch.float32)
+                has_cxr = False
+        elif has_cxr and self.cxr_transform is not None:
             try:
                 cxr = self.cxr_transform(row["cxr_path"], self.cxr_cfg, self.is_train)
             except Exception as e:
@@ -642,6 +735,8 @@ class AortaDataset(Dataset):
             ],
             dtype=torch.float32,
         )
+        if self.target_stats is not None:
+            target = self.target_stats.normalize(target)
 
         return {
             "ecg": ecg,

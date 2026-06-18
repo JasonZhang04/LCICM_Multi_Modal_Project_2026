@@ -2,7 +2,7 @@
 ECG encoder interface and implementations.
 
 ECGEncoder (abstract)
-  └── ResNet1DEncoder  — 1D ResNet-34, trained from scratch (baseline)
+  └── ResNet1DEncoder  — 1D ResNet-34, trained from scratch or with SimCLR pretrain
   └── ECGFMEncoder     — ECG-FM via fairseq_signals (stub, future implementation)
 
 All implementations share the same contract:
@@ -11,9 +11,12 @@ All implementations share the same contract:
 """
 
 import abc
+import logging
 
 import torch
 import torch.nn as nn
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +142,21 @@ class ResNet1DEncoder(ECGEncoder):
         x = self.pool(x).squeeze(-1)   # (B, out_dim)
         return x
 
+    def load_pretrained_weights(self, ckpt_path: str) -> None:
+        """
+        Load encoder weights saved by pretrain_ecg.py (encoder state_dict only).
+        Supports both raw state_dict files and dicts wrapped under an 'encoder' key.
+        """
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if isinstance(state, dict) and "encoder" in state:
+            state = state["encoder"]
+        missing, unexpected = self.load_state_dict(state, strict=True)
+        if missing:
+            _log.warning("load_pretrained_weights: missing keys: %s", missing)
+        if unexpected:
+            _log.warning("load_pretrained_weights: unexpected keys: %s", unexpected)
+        _log.info("Loaded SimCLR pretrained ECG encoder from %s", ckpt_path)
+
 
 # ---------------------------------------------------------------------------
 # ECG-FM stub (future implementation)
@@ -168,6 +186,47 @@ class ECGFMEncoder(ECGEncoder):
 
 
 # ---------------------------------------------------------------------------
+# PCLR frozen-embedding encoder
+# ---------------------------------------------------------------------------
+
+class PCLREmbeddingEncoder(ECGEncoder):
+    """
+    Frozen PCLR encoder backed by precomputed 320-dim embeddings.
+
+    The TF PCLR model is run ONCE offline (scripts/extract_pclr_embeddings.py)
+    and the resulting {subject_id: tensor(320,)} dict is stored on disk.
+    This class loads that dict and applies a learnable Linear(320 → out_dim)
+    projection during supervised training.
+
+    Input (forward): (B, 320) float32 — the precomputed PCLR embedding
+                     (returned by AortaDataset when ecg_embeddings is provided)
+    Output:          (B, out_dim) float32
+    """
+
+    def __init__(self, pclr_dim: int = 320, out_dim: int = 768):
+        super().__init__(out_dim=out_dim)
+        self.proj = torch.nn.Linear(pclr_dim, out_dim)
+        _log.info(
+            "PCLREmbeddingEncoder: Linear(%d → %d) projection (trained during fine-tuning)",
+            pclr_dim, out_dim,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 320) precomputed PCLR embedding
+        return self.proj(x)   # (B, out_dim)
+
+    @staticmethod
+    def load_embeddings(path: str) -> dict:
+        """
+        Load precomputed PCLR embeddings from a .pt file.
+        Returns {subject_id (int): tensor(320,)}.
+        """
+        embs = torch.load(path, map_location="cpu", weights_only=False)
+        _log.info("Loaded %d PCLR embeddings from %s", len(embs), path)
+        return embs
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -175,9 +234,14 @@ def build_ecg_encoder(cfg) -> ECGEncoder:
     """Instantiate the ECG encoder specified in ModelConfig."""
     if cfg.ecg_encoder == "resnet1d":
         return ResNet1DEncoder(out_dim=cfg.ecg_out_dim)
+    if cfg.ecg_encoder == "pclr_frozen":
+        return PCLREmbeddingEncoder(pclr_dim=320, out_dim=cfg.ecg_out_dim)
     if cfg.ecg_encoder == "ecgfm":
         return ECGFMEncoder(
             checkpoint_path=getattr(cfg, "ecgfm_checkpoint", ""),
             out_dim=cfg.ecg_out_dim,
         )
-    raise ValueError(f"Unknown ecg_encoder: {cfg.ecg_encoder!r}. Choose 'resnet1d' or 'ecgfm'.")
+    raise ValueError(
+        f"Unknown ecg_encoder: {cfg.ecg_encoder!r}. "
+        "Choose 'resnet1d', 'pclr_frozen', or 'ecgfm'."
+    )

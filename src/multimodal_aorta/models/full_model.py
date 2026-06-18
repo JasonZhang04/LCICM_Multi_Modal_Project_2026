@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from multimodal_aorta.configs.default_config import ModelConfig, TrainConfig
 from multimodal_aorta.models.ecg_encoder import build_ecg_encoder
-from multimodal_aorta.models.cxr_encoder import CXREncoder
+from multimodal_aorta.models.cxr_encoder import build_cxr_encoder
 from multimodal_aorta.models.fusion import FusionTransformer
 from multimodal_aorta.models.regression_head import RegressionHead
 
@@ -42,10 +42,14 @@ class AortaModel(nn.Module):
 
         self.ecg_encoder = build_ecg_encoder(model_cfg)
 
-        self.cxr_encoder = CXREncoder(
-            model_name=model_cfg.cxr_model_name,
-            freeze_blocks=model_cfg.cxr_freeze_blocks,
-        )
+        # Load SimCLR pretrained weights if a checkpoint path is provided.
+        # Sets _ecg_pretrained so get_param_groups() can apply a lower LR.
+        self._ecg_pretrained = False
+        if getattr(model_cfg, "ecg_pretrain_ckpt", None):
+            self.ecg_encoder.load_pretrained_weights(model_cfg.ecg_pretrain_ckpt)
+            self._ecg_pretrained = True
+
+        self.cxr_encoder = build_cxr_encoder(model_cfg)
 
         self.fusion = FusionTransformer(
             d_model=model_cfg.d_model,
@@ -124,15 +128,17 @@ class AortaModel(nn.Module):
         """
         Returns AdamW parameter groups with per-component learning rates.
 
-            ECG encoder:  lr_ecg_encoder  (trains from scratch — higher LR ok)
-            CXR encoder:  lr_cxr_encoder  (pretrained — conservative LR)
-            Fusion + head: lr_fusion      (new layers — highest LR)
+            ECG encoder:   lr_ecg_encoder   (random init) or
+                           lr_ecg_pretrained (SimCLR pretrained — conservative to avoid forgetting)
+            CXR encoder:   lr_cxr_encoder   (pretrained — conservative LR)
+            Fusion + head: lr_fusion        (new layers — highest LR)
         """
         tc = self.train_cfg
+        lr_ecg = tc.lr_ecg_pretrained if self._ecg_pretrained else tc.lr_ecg_encoder
         return [
             {
                 "params": list(self.ecg_encoder.parameters()),
-                "lr": tc.lr_ecg_encoder,
+                "lr": lr_ecg,
                 "name": "ecg_encoder",
             },
             {

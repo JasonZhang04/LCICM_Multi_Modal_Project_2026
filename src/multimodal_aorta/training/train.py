@@ -24,9 +24,14 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from multimodal_aorta.configs.default_config import Config
+from multimodal_aorta.data.dataset import TargetStats
 from multimodal_aorta.models.full_model import AortaModel
 from multimodal_aorta.training.losses import total_loss
-from multimodal_aorta.training.evaluate import evaluate, evaluate_ablation
+from multimodal_aorta.training.evaluate import (
+    evaluate,
+    evaluate_ablation,
+    evaluate_mean_baseline,
+)
 from multimodal_aorta.utils.logging_utils import CSVLogger, save_checkpoint, plot_training_curves
 
 logger = logging.getLogger(__name__)
@@ -81,6 +86,18 @@ class WarmupCosineScheduler:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _count_dual_modality(loader: DataLoader) -> int:
+    """Count samples in a loader that genuinely have BOTH ECG and CXR present."""
+    n = 0
+    for batch in loader:
+        n += int((batch["has_ecg"] & batch["has_cxr"]).sum().item())
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -91,6 +108,7 @@ def train(
     cfg: Config,
     output_dir: Optional[str] = None,
     device: Optional[torch.device] = None,
+    target_stats: Optional[TargetStats] = None,
 ) -> None:
     """
     Full training loop.
@@ -102,6 +120,10 @@ def train(
         cfg:          Config dataclass (cfg.train, cfg.model used)
         output_dir:   Where to save checkpoints and logs (overrides cfg.train.output_dir)
         device:       torch.device (auto-detects CUDA if None)
+        target_stats: train-split z-score stats; passed to evaluate() so
+                      reported MAE/R²/AUROC are de-normalized back to cm.
+                      When None, predictions and targets are assumed to
+                      already be in cm.
     """
     tc = cfg.train
     mc = cfg.model
@@ -143,6 +165,7 @@ def train(
     config_dict = {
         "model": dataclasses.asdict(mc),
         "train": dataclasses.asdict(tc),
+        "target_stats": dataclasses.asdict(target_stats) if target_stats is not None else None,
     }
 
     # --- Early stopping state ---
@@ -176,7 +199,7 @@ def train(
 
             with autocast("cuda", enabled=use_amp):
                 pred = model(ecg, cxr, has_ecg, has_cxr)
-                loss = total_loss(pred, target, delta=tc.huber_delta)
+                loss = total_loss(pred, target)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -193,7 +216,7 @@ def train(
         # ----------------------------------------------------------------
         # Validation
         # ----------------------------------------------------------------
-        val_metrics = evaluate(model, val_loader, device, huber_delta=tc.huber_delta)
+        val_metrics = evaluate(model, val_loader, device, target_stats=target_stats)
         val_mae = val_metrics.total_mae
 
         # ----------------------------------------------------------------
@@ -263,7 +286,7 @@ def train(
             break
 
     # Save final epoch checkpoint regardless
-    final_metrics = evaluate(model, val_loader, device, huber_delta=tc.huber_delta)
+    final_metrics = evaluate(model, val_loader, device, target_stats=target_stats)
     save_checkpoint(
         final_ckpt_path, model, optimizer, epoch + 1,
         {"val_mae": final_metrics.total_mae, **final_metrics.to_dict()},
@@ -272,17 +295,73 @@ def train(
     logger.info("Final checkpoint saved → %s", final_ckpt_path)
 
     # ----------------------------------------------------------------
-    # Test-set ablation (load best model, run ablation)
+    # Validation ablation + baselines (load best model)
     # ----------------------------------------------------------------
     logger.info("Running per-modality ablation on validation set with best model...")
     from multimodal_aorta.utils.logging_utils import load_checkpoint
     load_checkpoint(best_ckpt_path, model, device=device)
 
-    ablation = evaluate_ablation(model, val_loader, device, huber_delta=tc.huber_delta)
+    # --- Reference baseline: constant train-mean predictor (the bar to beat) ---
+    base_full = evaluate_mean_baseline(val_loader, target_stats=target_stats)
+    logger.info(
+        "Baseline [mean-predictor, full val] — MAE root=%.4f asc=%.4f  "
+        "R² root=%.3f asc=%.3f  (R²~0 by construction; MAE is the bar to beat)",
+        base_full.mae_root, base_full.mae_asc, base_full.r2_root, base_full.r2_asc,
+    )
+
+    # --- Whole-val ablation (NOTE: confounded by ECG-only patients; kept for
+    #     backward-comparison with earlier runs only) ---
+    logger.info(
+        "Per-modality ablation on FULL val set "
+        "(confounded by ECG-only patients — see dual-modality block below):"
+    )
+    ablation = evaluate_ablation(model, val_loader, device, target_stats=target_stats)
     for name, m in ablation.items():
         logger.info(
-            "Ablation [%s] — MAE root=%.4f asc=%.4f  R² root=%.3f asc=%.3f",
+            "Ablation [%s, full val] — MAE root=%.4f asc=%.4f  R² root=%.3f asc=%.3f",
             name, m.mae_root, m.mae_asc, m.r2_root, m.r2_asc,
+        )
+
+    # --- Dual-modality ablation (THE honest multimodal comparison) ---
+    # Scored ONLY on patients who genuinely have BOTH ECG and CXR, so
+    # 'both' vs 'ecg_only' vs 'cxr_only' isolates each modality's contribution.
+    n_both = _count_dual_modality(val_loader)
+    logger.info(
+        "Per-modality ablation on DUAL-MODALITY subset (n=%d patients with both ECG+CXR) "
+        "— this is the honest test of whether CXR adds signal:",
+        n_both,
+    )
+    if n_both < 2:
+        logger.warning(
+            "Dual-modality subset has <2 patients (n=%d); skipping dual-modality "
+            "ablation. CXR contribution cannot be measured on this split.", n_both,
+        )
+    else:
+        dual_ablation = evaluate_ablation(
+            model, val_loader, device, target_stats=target_stats, restrict_to_both=True,
+        )
+        base_dual = evaluate_mean_baseline(
+            val_loader, target_stats=target_stats, restrict_to_both=True,
+        )
+        logger.info(
+            "Baseline [mean-predictor, dual subset] — MAE root=%.4f asc=%.4f  "
+            "R² root=%.3f asc=%.3f",
+            base_dual.mae_root, base_dual.mae_asc, base_dual.r2_root, base_dual.r2_asc,
+        )
+        for name, m in dual_ablation.items():
+            logger.info(
+                "Ablation [%s, dual subset] — MAE root=%.4f asc=%.4f  "
+                "R² root=%.3f asc=%.3f  AUROC root=%.3f asc=%.3f",
+                name, m.mae_root, m.mae_asc, m.r2_root, m.r2_asc,
+                m.auroc_root, m.auroc_asc,
+            )
+        d_both = dual_ablation["both"]
+        d_ecg  = dual_ablation["ecg_only"]
+        logger.info(
+            "CXR marginal contribution (dual subset, both − ecg_only) — "
+            "ΔR² root=%+.3f asc=%+.3f  ΔMAE root=%+.4f asc=%+.4f",
+            d_both.r2_root - d_ecg.r2_root, d_both.r2_asc - d_ecg.r2_asc,
+            d_both.mae_root - d_ecg.mae_root, d_both.mae_asc - d_ecg.mae_asc,
         )
 
     if tb_writer is not None:

@@ -25,8 +25,10 @@ from multimodal_aorta.models.ecg_encoder import ResNet1DEncoder
 from multimodal_aorta.models.fusion import FusionTransformer
 from multimodal_aorta.models.regression_head import RegressionHead
 from multimodal_aorta.models.full_model import AortaModel
-from multimodal_aorta.training.losses import total_loss, masked_huber_loss
+from multimodal_aorta.training.losses import total_loss, masked_mse_loss
 from multimodal_aorta.training.evaluate import evaluate
+from multimodal_aorta.training.pretrain_ecg import ProjectionHead, nt_xent_loss
+from multimodal_aorta.data.ecg_pretrain_dataset import _augment
 from multimodal_aorta.utils.logging_utils import CSVLogger, save_checkpoint, load_checkpoint
 
 DEVICE = torch.device("cpu")
@@ -87,7 +89,7 @@ def _make_loader(n_batches=3):
 
 
 def test_masked_loss():
-    print("  [2] Masked Huber loss with NaN targets...", end=" ")
+    print("  [2] Masked MSE loss with NaN targets...", end=" ")
     pred = torch.randn(B, 2)
     target = torch.tensor([
         [3.0, 3.2],
@@ -100,10 +102,59 @@ def test_masked_loss():
     assert not torch.isnan(loss), "Loss must not be NaN"
     # All-NaN target should give 0 loss (nothing to optimise)
     all_nan = torch.full((B, 2), float("nan"))
-    loss_zero = masked_huber_loss(pred, all_nan)
+    loss_zero = masked_mse_loss(pred, all_nan)
     assert loss_zero.item() == 0.0, f"All-NaN loss should be 0, got {loss_zero.item()}"
     print("OK")
 
+
+
+def test_pretrain_components():
+    print("  [8] SimCLR pretrain components (NT-Xent loss, projection head, augmentations)...", end=" ")
+    import numpy as np
+
+    # NT-Xent: chance level = log(B); perfect alignment → 0
+    z1 = torch.randn(B, 128)
+    z2 = torch.randn(B, 128)
+    loss_rand = nt_xent_loss(z1, z2, tau=0.07)
+    assert not torch.isnan(loss_rand), "NT-Xent loss is NaN on random inputs"
+    assert loss_rand.item() > 0, "NT-Xent loss must be positive"
+    # Identical embeddings → cross entropy collapses: loss should be near 0
+    loss_identical = nt_xent_loss(z1, z1.clone(), tau=0.07)
+    assert loss_identical.item() < 0.01, f"Identical-view loss should be ~0, got {loss_identical.item():.4f}"
+
+    # ProjectionHead: (B, 768) → (B, 128)
+    head = ProjectionHead(in_dim=D, hidden_dim=512, out_dim=128)
+    h = torch.randn(B, D)
+    z = head(h)
+    assert z.shape == (B, 128), f"ProjectionHead output shape wrong: {z.shape}"
+    assert not torch.isnan(z).any(), "ProjectionHead output has NaN"
+
+    # ECG augmentations: output shape and value sanity
+    rng = np.random.default_rng(seed=42)
+    x = np.random.randn(12, 5000).astype(np.float32)
+    v1 = _augment(x, rng)
+    v2 = _augment(x, rng)
+    assert v1.shape == (12, 5000), f"Augmented view shape wrong: {v1.shape}"
+    assert v2.shape == (12, 5000)
+    assert not np.any(np.isnan(v1)), "Augmented view has NaN"
+    assert not np.all(v1 == v2), "Both views are identical — augmentation not working"
+
+    print("OK")
+
+
+def test_pretrain_weight_load():
+    print("  [9] SimCLR pretrained weight load/transfer...", end=" ")
+    encoder = ResNet1DEncoder(out_dim=D)
+    w_before = encoder.stages[0][0].conv1.weight.detach().clone()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ckpt = os.path.join(tmpdir, "fake_pretrain.pt")
+        # Save a modified state_dict (perturb weights)
+        sd = {k: v + 0.01 for k, v in encoder.state_dict().items()}
+        torch.save(sd, ckpt)
+        encoder.load_pretrained_weights(ckpt)
+    w_after = encoder.stages[0][0].conv1.weight.detach()
+    assert not torch.allclose(w_before, w_after), "Weights unchanged after load — load_pretrained_weights failed"
+    print("OK")
 
 
 def test_csv_logger():
@@ -208,6 +259,8 @@ if __name__ == "__main__":
         lambda: test_evaluate(shared_model),
         lambda: test_checkpoint(shared_model),
         test_csv_logger,
+        test_pretrain_components,
+        test_pretrain_weight_load,
     ]
 
     passed = 0

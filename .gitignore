@@ -36,3 +36,5 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+# Downloaded model snapshots and precomputed embeddings (too large / not source code)
+pretrained_checkpoints/

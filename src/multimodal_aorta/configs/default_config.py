@@ -60,6 +60,25 @@ class DataConfig:
     root_range: tuple = (1.5, 6.0)
     asc_range: tuple = (1.5, 7.0)
 
+    # --- PCLR precomputed embeddings ---
+    # Path to {subject_id: tensor(320,)} .pt file produced by extract_pclr_embeddings.py.
+    # When set, ecg_encoder is automatically treated as "pclr_frozen".
+    pclr_embeddings_path: Optional[str] = None
+
+    # --- RAD-DINO precomputed CXR embeddings ---
+    # Path to {subject_id: tensor(768,)} .pt file produced by
+    # extract_raddino_embeddings.py. When set, the CXR branch uses frozen
+    # precomputed embeddings (cxr_encoder="raddino_frozen") instead of running
+    # the 44M-param ViT end-to-end. This makes the trainable model tiny and is
+    # the recommended setup given only ~520 patients have a CXR.
+    cxr_embeddings_path: Optional[str] = None
+
+    # --- Target normalization (Step 1 redesign) ---
+    # When True, targets are z-scored using stats computed on the train split,
+    # and the model trains against z-scored targets with plain MSE. Reported
+    # metrics (MAE / R² / AUROC) are de-normalized back to cm.
+    target_normalize: bool = True
+
     # --- Splits ---
     train_frac: float = 0.70
     val_frac: float = 0.15
@@ -92,24 +111,50 @@ class ModelConfig:
     d_model: int = 768
 
     # ECG encoder
-    ecg_encoder: str = "resnet1d"   # "resnet1d" | "ecgfm" (future)
+    # "resnet1d"    — 1D ResNet-34, random init (or SimCLR-pretrained via ecg_pretrain_ckpt)
+    # "pclr_frozen" — frozen PCLR embeddings + learnable Linear(320→768) projection
+    # "ecgfm"       — future ECG-FM integration
+    ecg_encoder: str = "resnet1d"
     ecg_out_dim: int = 768          # output dim of ECGEncoder (must match d_model)
+    # Path to SimCLR-pretrained encoder weights (output of pretrain_ecg.py).
+    # When set, AortaModel loads these weights and uses lr_ecg_pretrained LR.
+    ecg_pretrain_ckpt: Optional[str] = None
 
-    # CXR encoder (RAD-DINO: ViT-B/16 pretrained on 882K chest X-rays)
-    cxr_model_name: str = "microsoft/rad-dino"
+    # CXR encoder
+    # "rad_dino"        — RAD-DINO ViT-B/16 run end-to-end (frozen as feature
+    #                     extractor by default; see cxr_freeze_blocks below)
+    # "raddino_frozen"  — frozen precomputed RAD-DINO embeddings + learnable
+    #                     Linear(768→d_model). Set via DataConfig.cxr_embeddings_path.
+    cxr_encoder: str = "rad_dino"
+    # Local snapshot of microsoft/rad-dino on /scratch4 (downloaded once via
+    # huggingface_hub.snapshot_download). Pointed at a local dir rather than the
+    # hub id so loads work offline on compute nodes and survive ~/.cache wipes
+    # (the home HF cache was cleared for quota; do not depend on it). To re-fetch:
+    #   HF_HOME=/scratch4/rsteven1/chenjia_echo_project/hf_home python -c \
+    #     "from huggingface_hub import snapshot_download; \
+    #      snapshot_download('microsoft/rad-dino', local_dir='<this path>')"
+    cxr_model_name: str = (
+        "/scratch4/rsteven1/chenjia_echo_project/2026 Multi-Modal Project/"
+        "pretrained_checkpoints/rad-dino"
+    )
     cxr_out_dim: int = 768          # RAD-DINO CLS token dim
-    cxr_freeze_blocks: int = 6      # freeze first N ViT blocks for first cxr_unfreeze_epoch epochs
-    cxr_unfreeze_epoch: int = 10    # unfreeze all blocks after warmup is fully settled
+    # RAD-DINO is kept FULLY FROZEN as a feature extractor. Fine-tuning a
+    # 44M-param ViT on the ~520 patients who have a CXR overfit catastrophically
+    # in earlier runs (val loss jumped the moment blocks unfroze). 12 = all
+    # ViT-B blocks frozen; unfreeze epoch set far beyond training horizon.
+    cxr_freeze_blocks: int = 12     # freeze ALL transformer blocks (ViT-B has 12)
+    cxr_unfreeze_epoch: int = 10_000  # effectively never unfreeze
 
-    # Fusion transformer
+    # Fusion transformer — kept small: only 2 tokens to fuse over ~520 dual-modality
+    # patients, so a deep/wide transformer just memorizes. 1 layer + narrow FFN.
     nhead: int = 8                  # 768 / 8 = 96 per head
-    num_fusion_layers: int = 3
-    dim_feedforward: int = 2048     # ~2.7× d_model
-    fusion_dropout: float = 0.1
+    num_fusion_layers: int = 1
+    dim_feedforward: int = 512      # narrow FFN to limit capacity
+    fusion_dropout: float = 0.2
 
     # Regression head
     head_hidden_dim: int = 256
-    head_dropout: float = 0.2
+    head_dropout: float = 0.3
 
     n_targets: int = 2              # [aortic_root_cm, ascending_aorta_cm]
 
@@ -117,20 +162,28 @@ class ModelConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 32
-    num_epochs: int = 100
-    early_stop_patience: int = 20
+    # Earlier runs overfit hard: val loss bottomed by epoch ~4 then climbed for
+    # 20 more epochs. Short horizon + tight patience selects the real best model.
+    num_epochs: int = 20
+    early_stop_patience: int = 8
 
     # Per-parameter-group learning rates
     # ECG encoder trains from scratch — keep LR modest to avoid early overfitting
     lr_ecg_encoder: float = 5e-5
+    # When a SimCLR pretrained checkpoint is loaded, this lower LR is used for
+    # the ECG encoder to prevent catastrophic forgetting of pretrained features.
+    lr_ecg_pretrained: float = 1e-5
     lr_cxr_encoder: float = 2e-5
     lr_fusion: float = 1e-4         # covers projection layers, fusion transformer, head
 
-    weight_decay: float = 0.05
+    weight_decay: float = 0.1    # stronger regularization for the small dataset
     grad_clip_norm: float = 1.0
-    warmup_epochs: int = 10
+    warmup_epochs: int = 3       # short warmup to match the 20-epoch horizon
 
     # Loss
+    # Note: as of Step 1, training uses plain MSE on z-scored targets.
+    # huber_delta is retained for backward compatibility with old checkpoints
+    # but is no longer used by the loss.
     huber_delta: float = 0.5
 
     # Modality dropout (training only)
@@ -141,9 +194,7 @@ class TrainConfig:
     num_workers: int = 4
     pin_memory: bool = True
 
-    output_dir: str = (
-        "/scratch4/rsteven1/chenjia_echo_project/2026 Multi-Modal Project/outputs/multimodal_aorta"
-    )
+    output_dir: str = "outputs/multimodal_aorta"
 
 
 @dataclass

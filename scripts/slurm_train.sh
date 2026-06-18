@@ -31,20 +31,26 @@ set -euo pipefail
 # The GPU node provides the NVIDIA driver; the venv provides everything else.
 
 PYTHON=/scratch4/rsteven1/your_env_name/bin/python3.10
-SRC_DIR="/scratch4/rsteven1/chenjia_echo_project/2026 Multi-Modal Project/src"
+PROJECT_DIR="/scratch4/rsteven1/chenjia_echo_project/2026 Multi-Modal Project"
+SRC_DIR="$PROJECT_DIR/src"
 
 # Use cached HuggingFace models — avoids 429 rate-limit delays on startup
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+
+# Run from the project root so that relative paths (e.g. outputs/run_name)
+# resolve against the project root, not src/.
+# src/ is added to PYTHONPATH so package imports continue to work.
+export PYTHONPATH="$SRC_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "Job ID:   $SLURM_JOB_ID"
 echo "Node:     $SLURMD_NODENAME"
 echo "GPU(s):   $CUDA_VISIBLE_DEVICES"
 echo "Started:  $(date)"
 
-cd "$SRC_DIR"
+cd "$PROJECT_DIR"
 
 # Run training (any extra args passed to sbatch are forwarded here)
-$PYTHON run_training.py "$@"
+$PYTHON src/run_training.py "$@"
 
 echo "Finished: $(date)"

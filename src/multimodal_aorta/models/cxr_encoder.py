@@ -93,3 +93,65 @@ class CXREncoder(nn.Module):
         else:
             if epoch == unfreeze_epoch:
                 self.unfreeze_all()
+
+
+class CXREmbeddingEncoder(nn.Module):
+    """
+    Frozen CXR encoder backed by precomputed RAD-DINO embeddings.
+
+    RAD-DINO is run ONCE offline (scripts/extract_raddino_embeddings.py) and the
+    resulting {subject_id: tensor(768,)} dict is stored on disk. This class loads
+    that dict (via AortaDataset) and applies a learnable Linear(768 → out_dim)
+    projection during supervised training — exactly mirroring PCLREmbeddingEncoder
+    on the ECG side.
+
+    Why: only ~520 cohort patients have a CXR. Fine-tuning the 44M-param ViT on
+    that many images overfit badly. Freezing it to precomputed features makes the
+    trainable model tiny and training seconds-fast.
+
+    Input (forward): (B, 768) float32 — precomputed RAD-DINO CLS embedding
+    Output:          (B, out_dim) float32
+    """
+
+    def __init__(self, cxr_dim: int = 768, out_dim: int = 768):
+        super().__init__()
+        self.out_dim = out_dim
+        self.proj = nn.Linear(cxr_dim, out_dim)
+        logger.info(
+            "CXREmbeddingEncoder: Linear(%d → %d) projection (trained during fine-tuning)",
+            cxr_dim, out_dim,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 768) precomputed RAD-DINO embedding
+        return self.proj(x)   # (B, out_dim)
+
+    # No-op freeze hooks so the training loop can treat all CXR encoders uniformly.
+    def set_frozen_for_epoch(self, epoch: int, unfreeze_epoch: int) -> None:
+        pass
+
+    @staticmethod
+    def load_embeddings(path: str) -> dict:
+        """Load precomputed RAD-DINO embeddings. Returns {subject_id (int): tensor(768,)}."""
+        embs = torch.load(path, map_location="cpu", weights_only=False)
+        logger.info("Loaded %d RAD-DINO embeddings from %s", len(embs), path)
+        return embs
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def build_cxr_encoder(cfg) -> nn.Module:
+    """Instantiate the CXR encoder specified in ModelConfig."""
+    kind = getattr(cfg, "cxr_encoder", "rad_dino")
+    if kind == "rad_dino":
+        return CXREncoder(
+            model_name=cfg.cxr_model_name,
+            freeze_blocks=cfg.cxr_freeze_blocks,
+        )
+    if kind == "raddino_frozen":
+        return CXREmbeddingEncoder(cxr_dim=cfg.cxr_out_dim, out_dim=cfg.d_model)
+    raise ValueError(
+        f"Unknown cxr_encoder: {kind!r}. Choose 'rad_dino' or 'raddino_frozen'."
+    )
