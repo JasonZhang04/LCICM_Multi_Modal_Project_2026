@@ -484,6 +484,7 @@ def build_cohort(
     max_days_offset: int = 180,
     cxr_extra_png_root: Optional[str] = None,
     cxr_metadata_csv: Optional[str] = None,
+    cohort_mode: str = "any",
 ) -> pd.DataFrame:
     """
     Build the final multi-modal cohort DataFrame.
@@ -492,6 +493,11 @@ def build_cohort(
       subject_id, target_root, target_asc, echo_date,
       ecg_path, cxr_path, cxr_view,
       has_ecg, has_cxr
+
+    cohort_mode:
+      "any"    — keep patients with at least one of ECG/CXR (v2 behavior).
+      "triple" — keep only patients with BOTH ECG and CXR (all already have an
+                 echo label) → the ~522 triple-modality cohort used by v3.
 
     Logs drop counts at each linkage step.
     """
@@ -583,13 +589,21 @@ def build_cohort(
         n_both, n_ecg_only, n_cxr_only, n_neither,
     )
 
-    # Drop patients with no modalities at all
-    cohort = cohort[cohort["has_ecg"] | cohort["has_cxr"]].reset_index(drop=True)
-    logger.info(
-        "After dropping no-modality patients: %d remain (dropped %d)",
-        len(cohort),
-        n_neither,
-    )
+    # Filter by cohort_mode
+    if cohort_mode == "triple":
+        keep = cohort["has_ecg"] & cohort["has_cxr"]
+        cohort = cohort[keep].reset_index(drop=True)
+        logger.info(
+            "cohort_mode='triple' — keeping ECG+CXR+echo patients: %d remain "
+            "(dropped %d)", len(cohort), len(keep) - int(keep.sum()),
+        )
+    else:
+        # Drop patients with no modalities at all
+        cohort = cohort[cohort["has_ecg"] | cohort["has_cxr"]].reset_index(drop=True)
+        logger.info(
+            "cohort_mode='any' — after dropping no-modality patients: %d remain "
+            "(dropped %d)", len(cohort), n_neither,
+        )
 
     # 5. Log temporal offset distributions
     if offset_log_ecg:

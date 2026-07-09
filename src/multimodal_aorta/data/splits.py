@@ -7,13 +7,110 @@ Patients with NaN root diameter are binned into their own stratum so they
 are also distributed proportionally.
 """
 import logging
-from typing import Tuple
+import os
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 logger = logging.getLogger(__name__)
+
+
+def load_fold_assignments(
+    path: str,
+    n_splits: int = 5,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Load the immutable fold assignments written by `scripts/build_fold_assignments.py`
+    and reconstruct the `(train_ids, test_ids)` list used everywhere else.
+
+    This is a drop-in replacement for `make_cv_folds`: the returned structure is
+    identical (a list of subject_id arrays), but the folds come from a frozen file
+    rather than being regenerated from a seed each run. That guarantees every
+    trainer shares one auditable fold definition even if a patient loses an
+    embedding (the trainer's own `idx_of` filtering then simply skips it, without
+    reshuffling anyone else).
+
+    Parameters
+    ----------
+    path : path to fold_assignments.csv (columns: subject_id, fold_id, ...)
+    n_splits : expected number of folds (validated against the file)
+
+    Returns
+    -------
+    folds : list of (train_ids, test_ids) subject_id arrays, ordered by fold_id.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"fold assignments not found at {path}; run "
+            "`python scripts/build_fold_assignments.py` first.")
+    fa = pd.read_csv(path)
+    assert {"subject_id", "fold_id"} <= set(fa.columns), \
+        "fold_assignments.csv must have 'subject_id' and 'fold_id'"
+    fa["subject_id"] = fa["subject_id"].astype(int)
+    assert fa["subject_id"].is_unique, "duplicate subject_id in fold assignments"
+    unique_folds = sorted(fa["fold_id"].unique())
+    if len(unique_folds) != n_splits:
+        logger.warning("fold file has %d folds (expected %d)", len(unique_folds), n_splits)
+
+    all_ids = fa["subject_id"].to_numpy()
+    folds: List[Tuple[np.ndarray, np.ndarray]] = []
+    for k in unique_folds:
+        test_ids = fa.loc[fa.fold_id == k, "subject_id"].to_numpy()
+        train_ids = np.setdiff1d(all_ids, test_ids)
+        folds.append((train_ids, test_ids))
+    logger.info("Loaded %d folds for %d subjects from %s", len(folds), len(all_ids), path)
+    return folds
+
+
+def load_fold_id_map(path: str) -> Dict[int, int]:
+    """Return {subject_id: fold_id} from the immutable fold assignments file."""
+    fa = pd.read_csv(path)
+    return {int(s): int(k) for s, k in zip(fa["subject_id"], fa["fold_id"])}
+
+
+def make_cv_folds(
+    cohort: pd.DataFrame,
+    stratify_col: str = "anyAD",
+    n_splits: int = 5,
+    seed: int = 42,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Stratified k-fold split by subject_id for the small triple-modality cohort.
+
+    Stratifies on a binary/low-cardinality column (default the patient-level
+    `anyAD` label from targets.add_grade_columns) so every fold contains AD
+    positives — essential at n~522 where positives are ~14%.
+
+    Parameters
+    ----------
+    cohort : DataFrame with 'subject_id' and `stratify_col`
+    stratify_col : column to stratify on (binary any-AD by default)
+    n_splits : number of CV folds
+    seed : random seed
+
+    Returns
+    -------
+    folds : list of (train_ids, test_ids) subject_id arrays, one per fold.
+    """
+    assert "subject_id" in cohort.columns, "cohort must contain 'subject_id'"
+    assert stratify_col in cohort.columns, f"cohort must contain '{stratify_col}'"
+
+    sids = cohort["subject_id"].to_numpy()
+    y = cohort[stratify_col].fillna(0).astype(int).to_numpy()
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    folds: List[Tuple[np.ndarray, np.ndarray]] = []
+    for k, (tr, te) in enumerate(skf.split(sids, y)):
+        train_ids, test_ids = sids[tr], sids[te]
+        n_pos = int(y[te].sum())
+        logger.info(
+            "CV fold %d/%d — train: %d  test: %d  (test AD+: %d)",
+            k + 1, n_splits, len(train_ids), len(test_ids), n_pos,
+        )
+        folds.append((train_ids, test_ids))
+    return folds
 
 
 def make_splits(
