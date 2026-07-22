@@ -70,6 +70,11 @@ def apply_ehr_scaler(ehr, scaler):
 def train_fold(model, opt, tr, va, tensors, device, max_epochs=200, patience=20, lambda_reg=0.3):
     from multimodal_aorta.training.ordinal import coral_loss, masked_mse, cum_probs, binary_metrics
     ecg, cxr, ehr, cum, zdiam = tensors
+    # NOTE (2026-07-16): tried selecting on validation LOSS instead of val AUROC on
+    # the theory that ~4 val positives make AUROC noisy. Empirically it was WORSE
+    # (root ge40 0.651->0.588, asc 0.669->0.623), so we keep val-AUROC selection.
+    # Deep fusion is behind the PCA-reduced GBDT (train_reduced_fusion.py) either
+    # way at n=522 — that is the recommended fusion path, not this model.
     best_score, best_state, no_imp = -1e9, None, 0
     history = []   # per-epoch (train_loss, val_loss, val_auroc) for curves
 

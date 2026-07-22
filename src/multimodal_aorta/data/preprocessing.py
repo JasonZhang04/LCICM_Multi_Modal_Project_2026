@@ -123,16 +123,24 @@ def _load_pil_from_path(path: str) -> "Image.Image":
     return Image.fromarray(pixel_array, mode="L")
 
 
-def load_cxr(path: str, cfg: "DataConfig", is_train: bool = False) -> torch.Tensor:
+def load_cxr(path: str, cfg: "DataConfig", is_train: bool = False, roi=None) -> torch.Tensor:
     """
     Load a chest X-ray (PNG or DICOM), convert to 3-channel float32 tensor.
 
     Steps:
       1. Load as grayscale PIL Image (handles both .png and .dcm).
       2. Replicate to 3 channels (grayscale → RGB).
-      3. Resize to cfg.cxr_image_size × cfg.cxr_image_size.
-      4. Apply training augmentations or val/test normalization.
-      5. Apply ImageNet normalization.
+      3. (M4c) Optionally crop to a fractional ROI (e.g. aorta/mediastinum) BEFORE
+         resizing, so the frozen encoder sees a zoomed-in view of the aortic region
+         instead of the whole-image CLS token (which dilutes the aortic silhouette).
+      4. Resize to cfg.cxr_image_size × cfg.cxr_image_size.
+      5. Apply training augmentations or val/test normalization.
+      6. Apply ImageNet normalization.
+
+    Parameters
+    ----------
+    roi : optional (x0, y0, x1, y1) fractional box in [0, 1] (left, upper, right,
+          lower). None -> whole image (unchanged behaviour).
 
     Returns
     -------
@@ -144,6 +152,12 @@ def load_cxr(path: str, cfg: "DataConfig", is_train: bool = False) -> torch.Tens
     img = _load_pil_from_path(path)
     # Replicate to RGB (BioViL-T expects 3-channel input)
     img = img.convert("RGB")
+
+    if roi is not None:
+        x0, y0, x1, y1 = roi
+        w, h = img.size
+        box = (int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))
+        img = img.crop(box)
 
     # --- Transforms ---
     size = cfg.cxr_image_size
