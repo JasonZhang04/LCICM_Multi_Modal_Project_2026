@@ -51,6 +51,18 @@ class DataConfig:
     col_root: str = "sinus_diam_cm"
     col_asc: str = "ascending_diam_cm"
 
+    # --- Cohort composition ---
+    # "any"    — patients with at least one of ECG/CXR (v2 multimodal-with-masking).
+    # "triple" — only patients with BOTH ECG and CXR + echo label (~522). v3 default.
+    cohort_mode: str = "triple"
+
+    # --- EHR features (v3) ---
+    # Cache produced by scripts/extract_ehr_features.py (one row per subject_id).
+    ehr_features_path: str = (
+        "/scratch4/rsteven1/chenjia_echo_project/2026 Multi-Modal Project/"
+        "pretrained_checkpoints/ehr_features.csv"
+    )
+
     # --- Temporal alignment ---
     max_days_offset: int = 180  # ECG/CXR must be within this many days of the echo
                                 # 180 days balances sample size vs temporal coherence;
