@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 OOF_COLUMNS = [
-    "subject_id", "fold_id", "model_name", "modality_set", "site", "endpoint",
+    "episode_id", "subject_id", "fold_id", "model_name", "modality_set", "site", "endpoint",
     "target_type", "y_true", "pred_prob", "pred_value",
     "has_ecg", "has_cxr", "has_ehr",
 ]
@@ -64,6 +64,7 @@ def build_records(
     has_ecg=1,
     has_cxr=1,
     has_ehr=1,
+    episode_ids=None,
 ) -> List[dict]:
     """
     Build a list of OOF row-dicts for one (model, site, endpoint) block.
@@ -72,6 +73,10 @@ def build_records(
     `fold_ids` may be a scalar, an array, or resolved by the caller from a
     subject->fold map. Rows whose y_true is NaN are kept (so coverage is
     auditable); the eval report drops them per metric as needed.
+
+    `episode_ids` (optional) tags each row with its "{subject}_{measurement}" key
+    for the episode-level rebuild; legacy patient-level callers omit it and the
+    column is left NaN.
     """
     subject_ids = [int(s) for s in subject_ids]
     n = len(subject_ids)
@@ -82,9 +87,11 @@ def build_records(
     has_ecg = _as_col(has_ecg, n)
     has_cxr = _as_col(has_cxr, n)
     has_ehr = _as_col(has_ehr, n)
+    episode_ids = _as_col(episode_ids, n)
     records = []
     for i in range(n):
         records.append({
+            "episode_id": episode_ids[i],
             "subject_id": subject_ids[i],
             "fold_id": fold_ids[i],
             "model_name": model_name,
