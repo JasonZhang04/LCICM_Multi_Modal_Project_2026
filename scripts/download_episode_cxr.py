@@ -58,6 +58,9 @@ logging.basicConfig(
               logging.FileHandler("cxr_episode_download.log", mode="a")],
 )
 log = logging.getLogger(__name__)
+# Retries are handled and reported via the failures file; silence urllib3's
+# per-retry WARNING spam so transient connect timeouts don't drown the log.
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 
 def build_tasks(manifest_path: str, limit: int | None) -> list[tuple[str, str]]:
@@ -145,7 +148,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--manifest", default=DEFAULT_MANIFEST)
     p.add_argument("--user", default=os.environ.get("PHYSIONET_USER"))
-    p.add_argument("--workers", type=int, default=16)
+    p.add_argument("--workers", type=int, default=8)
     p.add_argument("--limit", type=int, default=None,
                    help="Only fetch the first N missing files (use for a smoke test)")
     p.add_argument("--dry-run", action="store_true")

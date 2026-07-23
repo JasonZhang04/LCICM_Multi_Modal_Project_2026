@@ -35,13 +35,23 @@ if [[ -z "${PHYSIONET_USER:-}" || -z "${PHYSIONET_PASS:-}" ]]; then
     exit 1
 fi
 
+# Tunable without editing the file:
+#   DL_WORKERS  concurrent connections (default 12; PhysioNet throttles high
+#               concurrency per IP, so raise gradually while watching for
+#               ConnectTimeout failures)
+#   DL_LIMIT    stop after N files — use for a bounded compute-node smoke test
+WORKERS="${DL_WORKERS:-8}"
+LIMIT_ARG=""
+[[ -n "${DL_LIMIT:-}" ]] && LIMIT_ARG="--limit ${DL_LIMIT}"
+
 echo "host        : $(hostname)"
 echo "started     : $(date)"
+echo "workers     : ${WORKERS}   limit: ${DL_LIMIT:-none}"
 echo "manifest    : pretrained_checkpoints/cxr_download_manifest.csv"
 
-# Network-bound work: threads sit on I/O, so worker count can far exceed cores.
+# Network-bound work: threads sit on I/O, so worker count can exceed cores.
 # Each worker keeps one persistent keep-alive connection to PhysioNet.
-"$PY" scripts/download_episode_cxr.py --workers 24
+"$PY" scripts/download_episode_cxr.py --workers "$WORKERS" $LIMIT_ARG
 
 echo "finished    : $(date)"
 df -h /scratch4 | tail -1
