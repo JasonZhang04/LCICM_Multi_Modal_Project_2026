@@ -104,6 +104,10 @@ def _session() -> requests.Session:
     if s is None:
         s = requests.Session()
         s.headers["Authorization"] = _AUTH_HEADER
+        # PhysioNet's WAF returns 403 to the default python-requests User-Agent
+        # (verified: default UA -> 403, Wget UA -> 401). Present as wget so the
+        # request reaches the auth layer at all.
+        s.headers["User-Agent"] = "Wget/1.20.3"
         retry = Retry(total=3, backoff_factor=0.5,
                       status_forcelist=(500, 502, 503, 504),
                       allowed_methods=frozenset({"GET"}))
