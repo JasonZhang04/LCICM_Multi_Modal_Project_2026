@@ -141,7 +141,8 @@ def main():
     idx = {s: targets.index(s) for s in want if s in targets}
     log.info("Device=%s | structures=%s", device, idx)
 
-    inst = pd.read_csv(os.path.join(PC, "cxr_instances.csv"))
+    _INST = os.environ.get("CXR_INSTANCES", "cxr_instances.csv")  # episode rebuild: cxr_instances_episode.csv
+    inst = pd.read_csv(os.path.join(PC, _INST))
     inst = inst[inst.view_position.isin(["PA", "AP"])].reset_index(drop=True)
     log.info("Frontal instances: %d across %d patients", len(inst), inst.subject_id.nunique())
 

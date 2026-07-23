@@ -59,7 +59,8 @@ def main():
 
     enc = CXREncoder(model_name=cfg.model.cxr_model_name, freeze_blocks=12).eval().to(device)
 
-    inst = pd.read_csv(os.path.join(PC, "cxr_instances.csv"))
+    _INST = os.environ.get("CXR_INSTANCES", "cxr_instances.csv")  # episode rebuild: cxr_instances_episode.csv
+    inst = pd.read_csv(os.path.join(PC, _INST))
     inst = inst[inst.view_position.isin(["PA", "AP"])].reset_index(drop=True)
     log.info("Frontal instances: %d | device=%s", len(inst), device)
 

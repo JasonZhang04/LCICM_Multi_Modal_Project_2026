@@ -54,7 +54,8 @@ def main():
     idx = {s: list(seg.targets).index(s) for s in STRUCTS}
     enc = CXREncoder(model_name=cfg.model.cxr_model_name, freeze_blocks=12).eval().to(device)
 
-    inst = pd.read_csv(os.path.join(PC, "cxr_instances.csv"))
+    _INST = os.environ.get("CXR_INSTANCES", "cxr_instances.csv")  # episode rebuild: cxr_instances_episode.csv
+    inst = pd.read_csv(os.path.join(PC, _INST))
     log.info("Instances: %d across %d patients", len(inst), inst.subject_id.nunique())
 
     emb, roi_rows, nfail, nfallback = {}, [], 0, 0
