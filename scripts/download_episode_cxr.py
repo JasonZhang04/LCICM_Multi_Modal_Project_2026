@@ -29,6 +29,8 @@ Resume is automatic: files already present on disk are skipped, so re-running
 after an interruption picks up where it left off.
 """
 
+from __future__ import annotations   # allow 3.10 union hints under older interpreters
+
 import argparse
 import logging
 import os
