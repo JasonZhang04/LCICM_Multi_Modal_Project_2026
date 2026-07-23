@@ -32,14 +32,17 @@ after an interruption picks up where it left off.
 from __future__ import annotations   # allow 3.10 union hints under older interpreters
 
 import argparse
+import base64
 import logging
 import os
-import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import requests
+from urllib3.util.retry import Retry
 
 DEFAULT_MANIFEST = (
     "/scratch4/rsteven1/chenjia_echo_project/2026 Multi-Modal Project/"
@@ -77,23 +80,58 @@ def build_tasks(manifest_path: str, limit: int | None) -> list[tuple[str, str]]:
     return tasks
 
 
+# The previous implementation shelled out to wget once per file: a fresh
+# process, TCP connect, TLS handshake, and PhysioNet's 401-challenge round trip
+# on every single image. For 1.5 MB files on a fast network that overhead
+# dominated (~5 s/file), so throughput was ~0.1 files/s regardless of bandwidth.
+#
+# This version keeps one persistent requests.Session per worker thread. Two wins:
+#   - HTTP keep-alive reuses one TCP+TLS connection across all of that thread's
+#     files, so the handshake is paid once per worker, not once per file.
+#   - The Authorization header is sent preemptively, skipping the 401 challenge
+#     entirely (no wasted round trip to be told "auth required").
+# The remaining per-file cost is essentially just the transfer, so more workers
+# scale nearly linearly until PhysioNet or the NIC pushes back.
+
+_AUTH_HEADER = ""                     # set once in main(), read by every worker
+_thread_local = threading.local()
+CHUNK = 1 << 16
+
+
+def _session() -> requests.Session:
+    """One keep-alive Session per thread, created lazily on first use."""
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers["Authorization"] = _AUTH_HEADER
+        retry = Retry(total=3, backoff_factor=0.5,
+                      status_forcelist=(500, 502, 503, 504),
+                      allowed_methods=frozenset({"GET"}))
+        s.mount("https://", requests.adapters.HTTPAdapter(max_retries=retry))
+        _thread_local.session = s
+    return s
+
+
 def download_one(args: tuple) -> tuple[str, bool, str]:
-    """wget handles PhysioNet's 401-challenge -> 200 auth flow correctly."""
-    url, local_path, username, password = args
+    """Stream one file to disk over this thread's persistent session."""
+    url, local_path = args
+    tmp_path = local_path + ".part"     # write to .part so an interrupted file never looks complete
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     try:
-        r = subprocess.run(
-            ["wget", "-q", "--user", username, "--password", password,
-             "-O", local_path, "--tries=3", "--timeout=60", url],
-            capture_output=True, text=True,
-        )
-        if r.returncode == 0 and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-            return url, True, "ok"
-        if os.path.exists(local_path):
-            os.remove(local_path)      # don't leave truncated files to fool the resume check
-        err = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "unknown error"
-        return url, False, err
+        with _session().get(url, stream=True, timeout=(10, 120)) as r:
+            if r.status_code != 200:
+                return url, False, f"HTTP {r.status_code}"
+            with open(tmp_path, "wb") as fh:
+                for chunk in r.iter_content(CHUNK):
+                    fh.write(chunk)
+        if os.path.getsize(tmp_path) == 0:
+            os.remove(tmp_path)
+            return url, False, "empty response"
+        os.replace(tmp_path, local_path)   # atomic: the resume check only ever sees complete files
+        return url, True, "ok"
     except Exception as e:  # noqa: BLE001
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         return url, False, str(e)
 
 
@@ -103,7 +141,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--manifest", default=DEFAULT_MANIFEST)
     p.add_argument("--user", default=os.environ.get("PHYSIONET_USER"))
-    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--workers", type=int, default=16)
     p.add_argument("--limit", type=int, default=None,
                    help="Only fetch the first N missing files (use for a smoke test)")
     p.add_argument("--dry-run", action="store_true")
@@ -126,10 +164,14 @@ def main() -> None:
     password = os.environ.get("PHYSIONET_PASS") or getpass.getpass(
         f"PhysioNet password for {args.user}: ")
 
+    global _AUTH_HEADER
+    token = base64.b64encode(f"{args.user}:{password}".encode()).decode()
+    _AUTH_HEADER = f"Basic {token}"
+
     # Verify credentials on one real file before spawning workers, so a bad
-    # password fails in 2 seconds instead of 55,000 times in parallel.
+    # password fails immediately instead of 55,000 times in parallel.
     probe_url, probe_dest = tasks[0][0], "/tmp/physionet_auth_probe.jpg"
-    _, ok, msg = download_one((probe_url, probe_dest, args.user, password))
+    _, ok, msg = download_one((probe_url, probe_dest))
     if os.path.exists(probe_dest):
         os.remove(probe_dest)
     if not ok:
@@ -142,7 +184,7 @@ def main() -> None:
     report_every = max(1, len(tasks) // 40)
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = [pool.submit(download_one, (u, pth, args.user, password)) for u, pth in tasks]
+        futs = [pool.submit(download_one, (u, pth)) for u, pth in tasks]
         for fut in as_completed(futs):
             url, ok, msg = fut.result()
             n_done += 1

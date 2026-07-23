@@ -39,8 +39,9 @@ echo "host        : $(hostname)"
 echo "started     : $(date)"
 echo "manifest    : pretrained_checkpoints/cxr_download_manifest.csv"
 
-# 16 wget threads on 8 cores: downloads are network-bound, not CPU-bound.
-"$PY" scripts/download_episode_cxr.py --workers 16
+# Network-bound work: threads sit on I/O, so worker count can far exceed cores.
+# Each worker keeps one persistent keep-alive connection to PhysioNet.
+"$PY" scripts/download_episode_cxr.py --workers 24
 
 echo "finished    : $(date)"
 df -h /scratch4 | tail -1
