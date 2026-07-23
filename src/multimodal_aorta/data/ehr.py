@@ -118,9 +118,10 @@ def _nearest_record(
     sub_df: pd.DataFrame, echo_date: pd.Timestamp, value_col: str = "value"
 ) -> Tuple[float, float]:
     """
-    From one subject's records of a single type, return (value, offset_days) for
-    the chartdate nearest the echo date. If multiple records share that nearest
-    date, the median value is used. Returns (NaN, NaN) when none are valid.
+    Patient-level (legacy) matcher: chartdate NEAREST the echo date in EITHER
+    direction. Kept for the patient-level build_ehr_features path. The offset it
+    returns is UNSIGNED (abs days), which discards whether the record precedes or
+    follows the echo — the episode-level path below fixes that.
     """
     d = sub_df.dropna(subset=[value_col, "chartdate"])
     if d.empty:
@@ -138,6 +139,33 @@ def _nearest_record(
     return val, off
 
 
+def _pre_record(
+    sub_df: pd.DataFrame, index_date: pd.Timestamp, value_col: str = "value"
+) -> Tuple[float, float]:
+    """
+    Causal (episode-level) matcher: the most recent record AT OR BEFORE the index
+    (echo) date. Returns (value, offset_days) where offset_days = index_date -
+    chartdate >= 0 (a SIGNED offset, positive = days before the echo). This is the
+    fix for the audit's Problem 2: the legacy matcher took the nearest record in
+    either direction with abs offsets, so ~half of body-size values came from after
+    the echo (leakage) and the sign was discarded.
+
+    If the index date is missing, or the patient has no record on/before it,
+    returns (NaN, NaN) — a strictly pre-index feature must be missing rather than
+    reach forward in time.
+    """
+    if pd.isna(index_date):
+        return float("nan"), float("nan")
+    d = sub_df.dropna(subset=[value_col, "chartdate"])
+    d = d[d["chartdate"] <= index_date]
+    if d.empty:
+        return float("nan"), float("nan")
+    nearest_date = d["chartdate"].max()
+    val = float(d.loc[d["chartdate"] == nearest_date, value_col].median())
+    off = float((index_date - nearest_date).days)
+    return val, off
+
+
 def _clip(val: float, lo: float, hi: float) -> float:
     """Return val if within [lo, hi] else NaN."""
     if val is None or np.isnan(val):
@@ -146,8 +174,135 @@ def _clip(val: float, lo: float, hi: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Shared body-size derivation
+# ---------------------------------------------------------------------------
+
+def _body_size_row(sub, index_date, matcher):
+    """
+    Compute the body-size / BP block for one (patient, index_date) using the given
+    matcher (`_nearest_record` legacy, or `_pre_record` causal). `sub` is the
+    patient's omr rows or None. Returns a dict of physical-unit features + qc
+    offsets (height/weight/bmi/bp) with NaN for missing.
+    """
+    h_in = w_lb = bmi = sbp = dbp = float("nan")
+    h_off = w_off = bmi_off = bp_off = float("nan")
+    if sub is not None:
+        h_in, h_off   = matcher(sub[sub.result_name == RN_HEIGHT], index_date)
+        w_lb, w_off   = matcher(sub[sub.result_name == RN_WEIGHT], index_date)
+        bmi, bmi_off  = matcher(sub[sub.result_name == RN_BMI], index_date)
+        sbp, bp_off   = matcher(sub[sub.result_name == RN_BP], index_date, "sbp")
+        dbp, _        = matcher(sub[sub.result_name == RN_BP], index_date, "dbp")
+
+    height_cm = _clip(h_in * IN_TO_CM if not np.isnan(h_in) else np.nan, *RANGE_HEIGHT_CM)
+    weight_kg = _clip(w_lb * LB_TO_KG if not np.isnan(w_lb) else np.nan, *RANGE_WEIGHT_KG)
+    bmi       = _clip(bmi, *RANGE_BMI)
+    sbp       = _clip(sbp, *RANGE_SBP)
+    dbp       = _clip(dbp, *RANGE_DBP)
+
+    # height fallback from BMI + weight: height_m = sqrt(weight_kg / bmi)
+    if np.isnan(height_cm) and not np.isnan(weight_kg) and not np.isnan(bmi):
+        height_cm = _clip(float(np.sqrt(weight_kg / bmi) * 100.0), *RANGE_HEIGHT_CM)
+    # bmi fallback from height + weight
+    if np.isnan(bmi) and not np.isnan(weight_kg) and not np.isnan(height_cm):
+        bmi = _clip(float(weight_kg / (height_cm / 100.0) ** 2), *RANGE_BMI)
+    # BSA (Mosteller) needs height + weight
+    bsa = (float(np.sqrt(height_cm * weight_kg / 3600.0))
+           if (not np.isnan(height_cm) and not np.isnan(weight_kg)) else float("nan"))
+
+    return {
+        "height_cm": height_cm, "weight_kg": weight_kg, "bmi": bmi, "bsa": bsa,
+        "sbp": sbp, "dbp": dbp,
+        "height_missing": int(np.isnan(height_cm)),
+        "weight_missing": int(np.isnan(weight_kg)),
+        "bsa_missing":    int(np.isnan(bsa)),
+        "bp_missing":     int(np.isnan(sbp)),
+        "qc_height_offset_days": h_off,
+        "qc_weight_offset_days": w_off,
+        "qc_bmi_offset_days":    bmi_off,
+        "qc_bp_offset_days":     bp_off,
+    }
+
+
+def _demographics(pat, sid, index_year):
+    """(age at index_year, sex 1=M/0=F) for one subject, NaN if absent."""
+    age = sex = np.nan
+    if sid in pat.index:
+        prow = pat.loc[sid]
+        if not np.isnan(index_year):
+            age = float(prow["anchor_age"] + (index_year - prow["anchor_year"]))
+        else:
+            age = float(prow["anchor_age"])
+        sex = 1.0 if str(prow["gender"]).upper().startswith("M") else 0.0
+    return age, sex
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def build_ehr_features_per_episode(
+    episodes: pd.DataFrame,   # columns: episode_id, subject_id, echo_dt (index date)
+    patients_path: str,
+    omr_path: str,
+) -> pd.DataFrame:
+    """
+    Build one EHR feature row per EPISODE, using only records at or before that
+    episode's index (echo) date. This is the episode-level, causal replacement for
+    build_ehr_features:
+
+      - one row per (patient, echo study), keyed by episode_id
+      - age computed at the episode's own index year (not the patient's first echo)
+      - body-size / BP matched pre-index only, with SIGNED offsets retained for
+        height, weight, bmi, AND bp (the legacy path dropped the bp offset)
+
+    Returns DataFrame with episode_id, subject_id, measurement_id, FEATURE_COLS,
+    and qc_*_offset_days columns. Raw physical units; NaN for missing.
+    """
+    req = {"episode_id", "subject_id", "echo_dt"}
+    assert req <= set(episodes.columns), f"episodes must contain {req}"
+    subjects = set(int(s) for s in episodes["subject_id"].tolist())
+
+    pat = pd.read_csv(patients_path,
+                      usecols=["subject_id", "gender", "anchor_age", "anchor_year"])
+    pat = pat[pat["subject_id"].isin(subjects)].set_index("subject_id")
+
+    omr = _read_omr_for_subjects(omr_path, subjects)
+    omr_by_subj = {sid: g for sid, g in omr.groupby("subject_id")}
+
+    has_mid = "measurement_id" in episodes.columns
+    rows = []
+    for r in episodes.itertuples(index=False):
+        sid = int(r.subject_id)
+        index_date = r.echo_dt if not pd.isna(r.echo_dt) else pd.NaT
+        index_year = index_date.year if not pd.isna(index_date) else np.nan
+
+        age, sex = _demographics(pat, sid, index_year)
+        body = _body_size_row(omr_by_subj.get(sid), index_date, _pre_record)
+
+        row = {
+            "episode_id": r.episode_id,
+            "subject_id": sid,
+            "measurement_id": int(r.measurement_id) if has_mid else -1,
+            "age": age, "sex": sex,
+        }
+        row.update(body)
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    logger.info(
+        "Per-episode EHR: %d episodes / %d patients | age n=%d height n=%d "
+        "weight n=%d bsa n=%d bp n=%d",
+        len(out), out["subject_id"].nunique(), out["age"].notna().sum(),
+        out["height_cm"].notna().sum(), out["weight_kg"].notna().sum(),
+        out["bsa"].notna().sum(), out["sbp"].notna().sum())
+    if len(out):
+        for c in ("qc_height_offset_days", "qc_weight_offset_days", "qc_bp_offset_days"):
+            s = out[c].dropna()
+            if len(s):
+                logger.info("  %s: median %.0f d, p90 %.0f d, max %.0f d (all >=0, pre-index)",
+                            c, s.median(), s.quantile(0.9), s.max())
+    return out
+
 
 def build_ehr_features(
     echo_dates: pd.DataFrame,   # columns: subject_id, echo_date (datetime)
@@ -178,59 +333,11 @@ def build_ehr_features(
         echo_date = r.echo_date if not pd.isna(r.echo_date) else pd.NaT
         echo_year = echo_date.year if not pd.isna(echo_date) else np.nan
 
-        # demographics
-        age = sex = np.nan
-        if sid in pat.index:
-            prow = pat.loc[sid]
-            if not np.isnan(echo_year):
-                age = float(prow["anchor_age"] + (echo_year - prow["anchor_year"]))
-            else:
-                age = float(prow["anchor_age"])
-            sex = 1.0 if str(prow["gender"]).upper().startswith("M") else 0.0
-
-        # body size from omr
-        sub = omr_by_subj.get(sid)
-        h_in = w_lb = bmi = sbp = dbp = float("nan")
-        h_off = w_off = float("nan")
-        if sub is not None:
-            h_in, h_off = _nearest_record(sub[sub.result_name == RN_HEIGHT], echo_date)
-            w_lb, w_off = _nearest_record(sub[sub.result_name == RN_WEIGHT], echo_date)
-            bmi, _      = _nearest_record(sub[sub.result_name == RN_BMI], echo_date)
-            sbp, _      = _nearest_record(sub[sub.result_name == RN_BP], echo_date, "sbp")
-            dbp, _      = _nearest_record(sub[sub.result_name == RN_BP], echo_date, "dbp")
-
-        height_cm = _clip(h_in * IN_TO_CM if not np.isnan(h_in) else np.nan, *RANGE_HEIGHT_CM)
-        weight_kg = _clip(w_lb * LB_TO_KG if not np.isnan(w_lb) else np.nan, *RANGE_WEIGHT_KG)
-        bmi       = _clip(bmi, *RANGE_BMI)
-        sbp       = _clip(sbp, *RANGE_SBP)
-        dbp       = _clip(dbp, *RANGE_DBP)
-
-        # height fallback from BMI + weight: height_m = sqrt(weight_kg / bmi)
-        if np.isnan(height_cm) and not np.isnan(weight_kg) and not np.isnan(bmi):
-            height_cm = _clip(float(np.sqrt(weight_kg / bmi) * 100.0), *RANGE_HEIGHT_CM)
-
-        # bmi fallback from height + weight
-        if np.isnan(bmi) and not np.isnan(weight_kg) and not np.isnan(height_cm):
-            bmi = _clip(float(weight_kg / (height_cm / 100.0) ** 2), *RANGE_BMI)
-
-        # BSA (Mosteller) needs height + weight
-        if not np.isnan(height_cm) and not np.isnan(weight_kg):
-            bsa = float(np.sqrt(height_cm * weight_kg / 3600.0))
-        else:
-            bsa = float("nan")
-
-        rows.append({
-            "subject_id": sid,
-            "age": age, "sex": sex,
-            "height_cm": height_cm, "weight_kg": weight_kg, "bmi": bmi, "bsa": bsa,
-            "sbp": sbp, "dbp": dbp,
-            "height_missing": int(np.isnan(height_cm)),
-            "weight_missing": int(np.isnan(weight_kg)),
-            "bsa_missing":    int(np.isnan(bsa)),
-            "bp_missing":     int(np.isnan(sbp)),
-            "qc_height_offset_days": h_off,
-            "qc_weight_offset_days": w_off,
-        })
+        age, sex = _demographics(pat, sid, echo_year)
+        body = _body_size_row(omr_by_subj.get(sid), echo_date, _nearest_record)
+        row = {"subject_id": sid, "age": age, "sex": sex}
+        row.update(body)
+        rows.append(row)
 
     out = pd.DataFrame(rows)
     logger.info(

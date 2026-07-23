@@ -92,6 +92,92 @@ def paired_bootstrap_diff(
     return point, float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5))
 
 
+def cluster_bootstrap_ci(
+    y: np.ndarray,
+    p: np.ndarray,
+    groups: np.ndarray,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    n_boot: int = 2000,
+    seed: int = 0,
+    need_both_classes: bool = True,
+) -> Tuple[float, float, float]:
+    """
+    Percentile bootstrap CI that resamples PATIENTS (clusters), not rows.
+
+    In the episode-level cohort each patient contributes several correlated
+    episodes, so resampling rows understates uncertainty (it treats an ~1.3x
+    inflated, correlated sample as independent). Here we resample whole patients
+    with replacement and pool all episodes of each drawn patient, which is the
+    standard cluster bootstrap. When every row is its own group this reduces to
+    the ordinary row bootstrap.
+
+    `groups` is an array aligned with y/p giving each row's patient id.
+    """
+    m = ~np.isnan(y) & ~np.isnan(p)
+    y, p, groups = y[m], p[m], np.asarray(groups)[m]
+    if len(y) < 2:
+        return float("nan"), float("nan"), float("nan")
+    point = float(metric_fn(y, p))
+
+    uniq = np.unique(groups)
+    # Precompute row indices per patient so each resample is a cheap concat.
+    rows_of = {g: np.where(groups == g)[0] for g in uniq}
+    rng = np.random.default_rng(seed)
+    vals = []
+    for _ in range(n_boot):
+        drawn = rng.choice(uniq, len(uniq), replace=True)
+        idx = np.concatenate([rows_of[g] for g in drawn])
+        if need_both_classes and len(np.unique(y[idx])) < 2:
+            continue
+        try:
+            vals.append(float(metric_fn(y[idx], p[idx])))
+        except Exception:  # noqa: BLE001
+            continue
+    if not vals:
+        return point, float("nan"), float("nan")
+    return point, float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+
+def paired_cluster_bootstrap_diff(
+    y: np.ndarray,
+    p_a: np.ndarray,
+    p_b: np.ndarray,
+    groups: np.ndarray,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    n_boot: int = 2000,
+    seed: int = 0,
+    need_both_classes: bool = True,
+) -> Tuple[float, float, float]:
+    """
+    Patient-clustered analogue of paired_bootstrap_diff: the paired A-vs-B
+    difference test (e.g. multimodal vs the EHR floor) with whole patients drawn
+    together. Rows with NaN in y, p_a, or p_b are dropped so both models are
+    compared on the identical episode set.
+    """
+    m = ~np.isnan(y) & ~np.isnan(p_a) & ~np.isnan(p_b)
+    y, p_a, p_b, groups = y[m], p_a[m], p_b[m], np.asarray(groups)[m]
+    if len(y) < 2:
+        return float("nan"), float("nan"), float("nan")
+    point = float(metric_fn(y, p_a) - metric_fn(y, p_b))
+
+    uniq = np.unique(groups)
+    rows_of = {g: np.where(groups == g)[0] for g in uniq}
+    rng = np.random.default_rng(seed)
+    diffs = []
+    for _ in range(n_boot):
+        drawn = rng.choice(uniq, len(uniq), replace=True)
+        idx = np.concatenate([rows_of[g] for g in drawn])
+        if need_both_classes and len(np.unique(y[idx])) < 2:
+            continue
+        try:
+            diffs.append(float(metric_fn(y[idx], p_a[idx]) - metric_fn(y[idx], p_b[idx])))
+        except Exception:  # noqa: BLE001
+            continue
+    if not diffs:
+        return point, float("nan"), float("nan")
+    return point, float(np.percentile(diffs, 2.5)), float(np.percentile(diffs, 97.5))
+
+
 # Convenience metric fns ----------------------------------------------------
 
 def auroc(y, p):

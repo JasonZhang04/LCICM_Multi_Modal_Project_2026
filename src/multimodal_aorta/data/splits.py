@@ -70,6 +70,86 @@ def load_fold_id_map(path: str) -> Dict[int, int]:
     return {int(s): int(k) for s, k in zip(fa["subject_id"], fa["fold_id"])}
 
 
+def load_episode_folds(
+    path: str,
+    n_splits: int = 5,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Episode-level analogue of load_fold_assignments.
+
+    Loads `episode_fold_assignments.csv` (columns: episode_id, subject_id,
+    measurement_id, fold_id, ...) and returns `(train_episode_ids, test_episode_ids)`
+    per fold. Folds are PATIENT-grouped in the file (every episode of a patient
+    shares one fold_id), so returning episode ids here cannot leak a patient
+    across the boundary.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"episode fold assignments not found at {path}; run "
+            "`python scripts/build_episode_folds.py` first.")
+    fa = pd.read_csv(path)
+    assert {"episode_id", "subject_id", "fold_id"} <= set(fa.columns), \
+        "episode_fold_assignments.csv must have episode_id, subject_id, fold_id"
+    fa["episode_id"] = fa["episode_id"].astype(str)
+    assert fa["episode_id"].is_unique, "duplicate episode_id in fold assignments"
+    # A patient must live in exactly one fold.
+    per_pt_folds = fa.groupby("subject_id")["fold_id"].nunique()
+    assert (per_pt_folds == 1).all(), \
+        f"{int((per_pt_folds > 1).sum())} patients span multiple folds — grouping is broken"
+
+    all_eids = fa["episode_id"].to_numpy()
+    folds: List[Tuple[np.ndarray, np.ndarray]] = []
+    for k in sorted(fa["fold_id"].unique()):
+        test_eids = fa.loc[fa.fold_id == k, "episode_id"].to_numpy()
+        train_eids = np.setdiff1d(all_eids, test_eids)
+        folds.append((train_eids, test_eids))
+    logger.info("Loaded %d episode folds for %d episodes / %d patients from %s",
+                len(folds), len(all_eids), fa["subject_id"].nunique(), path)
+    return folds
+
+
+def load_episode_fold_id_map(path: str) -> Dict[str, int]:
+    """Return {episode_id: fold_id} from the episode fold assignments file."""
+    fa = pd.read_csv(path)
+    return {str(e): int(k) for e, k in zip(fa["episode_id"], fa["fold_id"])}
+
+
+def make_grouped_cv_folds(
+    episodes: pd.DataFrame,
+    stratify_col: str = "anyAD",
+    group_col: str = "subject_id",
+    id_col: str = "episode_id",
+    n_splits: int = 5,
+    seed: int = 42,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Patient-grouped, stratified k-fold over EPISODES.
+
+    Every episode of a patient goes to the same fold (grouped by `group_col`),
+    while folds are balanced on `stratify_col` (episode-level any-AD). Returns
+    `(train_episode_ids, test_episode_ids)` per fold. Used by the repeated-CV
+    trainers to regenerate folds per seed the same way the immutable file was built.
+    """
+    from sklearn.model_selection import StratifiedGroupKFold
+    for c in (stratify_col, group_col, id_col):
+        assert c in episodes.columns, f"episodes must contain '{c}'"
+
+    eids = episodes[id_col].astype(str).to_numpy()
+    groups = episodes[group_col].astype(int).to_numpy()
+    y = episodes[stratify_col].fillna(0).astype(int).to_numpy()
+
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    folds: List[Tuple[np.ndarray, np.ndarray]] = []
+    for k, (tr, te) in enumerate(sgkf.split(eids, y, groups)):
+        # Defensive: no patient may appear in both sides.
+        assert not (set(groups[tr]) & set(groups[te])), \
+            f"patient leak in grouped fold {k}"
+        folds.append((eids[tr], eids[te]))
+        logger.info("grouped fold %d/%d — train ep: %d  test ep: %d  (test AD+ ep: %d)",
+                    k + 1, n_splits, len(tr), len(te), int(y[te].sum()))
+    return folds
+
+
 def make_cv_folds(
     cohort: pd.DataFrame,
     stratify_col: str = "anyAD",
