@@ -152,7 +152,15 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=None,
                    help="Only fetch the first N missing files (use for a smoke test)")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--count-remaining", action="store_true",
+                   help="Print how many manifest files are not yet on disk, then exit "
+                        "(used by the slurm chain to decide whether to resubmit).")
     args = p.parse_args()
+
+    if args.count_remaining:
+        logging.disable(logging.CRITICAL)   # keep stdout to just the number
+        print(len(build_tasks(args.manifest, None)))
+        return
 
     tasks = build_tasks(args.manifest, args.limit)
     if not tasks:
