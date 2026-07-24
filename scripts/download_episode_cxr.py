@@ -196,7 +196,9 @@ def main() -> None:
 
     start, n_done, n_ok, n_fail = time.time(), 0, 0, 0
     failures = []
-    report_every = max(1, len(tasks) // 40)
+    # Cap the interval: at PhysioNet's ~0.09 files/s a len//40 stride would be
+    # hours between lines, hiding stalls. 100 files ~= every ~18 min here.
+    report_every = max(1, min(len(tasks) // 40, 100))
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futs = [pool.submit(download_one, (u, pth)) for u, pth in tasks]
