@@ -182,19 +182,21 @@ def main():
         m = dict(zip(e.episode_id, e.pred_value))
         return np.array([m.get(x, np.nan) for x in eids])
 
+    from multimodal_aorta.training.bootstrap import paired_cluster_bootstrap_diff
     results = {"seeds": SEEDS, "mock": MOCK, "n_episodes": len(eids),
                "n_patients": int(ep.subject_id.nunique()), "sites": {}}
+    oof_rows = []   # per-episode OOF for reproducibility (audit Problem 5)
     for site in ("root", "asc"):
         d = diam[site]; d_ehr = ehr_diam(site)
         y40 = np.where(np.isnan(d), np.nan, (d >= 4.0).astype(float))
         y45 = np.where(np.isnan(d), np.nan, (d >= 4.5).astype(float))
         per_seed = {"ge40": [], "ge45": [], "r2": [], "mae": []}
-        last = None
+        seed_preds = []
         for seed in SEEDS:
             folds = make_grouped_cv_folds(ep, stratify_col="anyAD", n_splits=5, seed=seed)
             d_cxr = cxr_base_oof(folds, d, blocks, Xgeom, I_eid, I_sid, Iw, row_of)
             d_st = ridge_stack(np.column_stack([d_cxr, d_ehr]), d, folds, row_of)
-            last = d_st
+            seed_preds.append(d_st)
             def _m(y, p, fn, nb=True):
                 k = ~np.isnan(y) & ~np.isnan(p)
                 if k.sum() < 3 or (nb and len(np.unique(y[k])) < 2):
@@ -204,22 +206,36 @@ def main():
             per_seed["ge45"].append(_m(y45, d_st, auroc))
             per_seed["r2"].append(_m(d, d_st, r2, nb=False))
             per_seed["mae"].append(_m(d, d_st, mae, nb=False))
+        # Average the per-seed OOF predictions -> a stable score for CIs / paired tests
+        # / saved OOF (repeated-CV reduces fold-split variance in the per-patient score).
+        d_bar = np.nanmean(np.column_stack(seed_preds), axis=1)
         sr = {k: {"mean": float(np.nanmean(v)), "sd": float(np.nanstd(v)),
                   "per_seed": [round(float(x), 4) for x in v]} for k, v in per_seed.items()}
-        sr["ge40_ci_lastseed"] = fmt(cluster_bootstrap_ci(y40, last, sid_of_row, auroc))
-        sr["r2_ci_lastseed"] = fmt(cluster_bootstrap_ci(d, last, sid_of_row, r2, need_both_classes=False))
+        sr["ge40_ci"] = fmt(cluster_bootstrap_ci(y40, d_bar, sid_of_row, auroc))
+        sr["r2_ci"] = fmt(cluster_bootstrap_ci(d, d_bar, sid_of_row, r2, need_both_classes=False))
+        # PAIRED cluster-bootstrap vs the EHR floor (both are predicted diameters;
+        # ranking by them gives the ge40/ge45 score). CI excluding 0 => stack beats floor.
+        sr["ge40_vs_floor"] = fmt(paired_cluster_bootstrap_diff(y40, d_bar, d_ehr, sid_of_row, auroc))
+        sr["ge45_vs_floor"] = fmt(paired_cluster_bootstrap_diff(y45, d_bar, d_ehr, sid_of_row, auroc))
+        sr["r2_vs_floor"] = fmt(paired_cluster_bootstrap_diff(
+            d, d_bar, d_ehr, sid_of_row, r2, need_both_classes=False))
         results["sites"][site] = sr
+        for i, e in enumerate(eids):
+            oof_rows.append({"episode_id": e, "subject_id": int(sid_of_row[i]), "site": site,
+                             "diam_true": d[i], "pred_stack": d_bar[i], "pred_floor": d_ehr[i]})
         log.info("[%s] ge40 %.3f+-%.3f | ge45 %.3f+-%.3f | R2 %.3f+-%.3f | MAE %.3f",
                  site, sr["ge40"]["mean"], sr["ge40"]["sd"], sr["ge45"]["mean"], sr["ge45"]["sd"],
                  sr["r2"]["mean"], sr["r2"]["sd"], sr["mae"]["mean"])
-        log.info("    ge40 CI(last seed, clustered) %s", sr["ge40_ci_lastseed"])
+        log.info("    ge40 CI %s | vs floor ge40 %s | vs floor R2 %s",
+                 sr["ge40_ci"], sr["ge40_vs_floor"], sr["r2_vs_floor"])
 
     out_dir = os.path.join(ROOT, "outputs",
                            "geometry_stack_episode" + ("_mock" if MOCK else ""))
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    log.info("Saved -> %s/results.json", out_dir)
+    pd.DataFrame(oof_rows).to_csv(os.path.join(out_dir, "oof_predictions.csv"), index=False)
+    log.info("Saved -> %s/{results.json, oof_predictions.csv}", out_dir)
 
 
 if __name__ == "__main__":
