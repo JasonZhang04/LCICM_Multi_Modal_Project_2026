@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PC = os.path.join(PROJ, "pretrained_checkpoints")
-OUT = os.path.join(PC, "cxr_geometry_features.csv")
+OUT = os.path.join(PC, os.environ.get("GEOMETRY_OUT", "cxr_geometry_features.csv"))
 S = 512
 THRESH = 0.5
 BATCH = 16
@@ -144,9 +144,28 @@ def main():
     _INST = os.environ.get("CXR_INSTANCES", "cxr_instances.csv")  # episode rebuild: cxr_instances_episode.csv
     inst = pd.read_csv(os.path.join(PC, _INST))
     inst = inst[inst.view_position.isin(["PA", "AP"])].reset_index(drop=True)
-    log.info("Frontal instances: %d across %d patients", len(inst), inst.subject_id.nunique())
 
-    rows, nfail, nseg_bad = [], 0, 0
+    # Resume: load rows already computed and skip those dicoms (multi-hour job at 60k).
+    rows = []
+    if os.path.exists(OUT):
+        try:
+            prev = pd.read_csv(OUT)
+            rows = prev.to_dict("records")
+            done = set(prev.dicom_id.astype(str))
+            inst = inst[~inst.dicom_id.astype(str).isin(done)].reset_index(drop=True)
+            log.info("resume: loaded %d existing rows; %d instances left", len(rows), len(inst))
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not load %s (%s) — starting fresh", OUT, e)
+    log.info("Frontal instances: %d to do across %d patients", len(inst), inst.subject_id.nunique())
+
+    SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "4000"))
+
+    def _checkpoint():
+        tmp = OUT + ".tmp"
+        pd.DataFrame(rows).to_csv(tmp, index=False)
+        os.replace(tmp, OUT)
+
+    nfail, nseg_bad, last_saved = 0, 0, len(rows)
     with torch.no_grad():
         for start in range(0, len(inst), BATCH):
             b = inst.iloc[start:start + BATCH]
@@ -169,9 +188,12 @@ def main():
                              "seg_ok": int(ok), **f})
             if start % (BATCH * 20) == 0:
                 log.info("  %d/%d (bad_seg=%d fail=%d)", start + len(b), len(inst), nseg_bad, nfail)
+            if len(rows) - last_saved >= SAVE_EVERY:
+                _checkpoint(); last_saved = len(rows)
+                log.info("  checkpoint: %d rows saved", len(rows))
 
+    _checkpoint()
     df = pd.DataFrame(rows)
-    df.to_csv(OUT, index=False)
     log.info("Saved %d rows -> %s (bad_seg=%d fail=%d)", len(df), OUT, nseg_bad, nfail)
     log.info("Feature coverage (non-null %%):\n%s",
              (df[FEATURES].notna().mean() * 100).round(1).to_string())

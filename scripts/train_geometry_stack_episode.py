@@ -74,11 +74,13 @@ def load_instance_features(inst):
         Xgeom = rng.standard_normal((len(dids), len(GEOM))).astype(np.float32)
         return blocks, Xgeom
     import torch
-    pp = torch.load(os.path.join(PC, "raddino_patchpool_embeddings.pt"),
+    pp = torch.load(os.path.join(PC, os.environ.get("PATCHPOOL_OUT",
+                    "raddino_patchpool_embeddings_episode.pt")),
                     map_location="cpu", weights_only=False)
     pp = {str(k): {kk: (vv.numpy() if hasattr(vv, "numpy") else np.asarray(vv))
                    for kk, vv in v.items()} for k, v in pp.items()}
-    geo = pd.read_csv(os.path.join(PC, "cxr_geometry_features.csv"))
+    geo = pd.read_csv(os.path.join(PC, os.environ.get("GEOMETRY_OUT",
+                      "cxr_geometry_features_episode.csv")))
     inst = inst.merge(geo[["dicom_id"] + GEOM], on="dicom_id", how="left")
     blocks = [np.vstack([pp[d][pool] for d in dids]).astype(np.float32) for pool in POOLS]
     Xgeom = inst[GEOM].to_numpy(np.float32)
@@ -160,7 +162,8 @@ def main():
     inst = inst[inst.episode_id.isin(set(eids))].reset_index(drop=True)
     if not MOCK:
         import torch
-        pp = torch.load(os.path.join(PC, "raddino_patchpool_embeddings.pt"),
+        pp = torch.load(os.path.join(PC, os.environ.get("PATCHPOOL_OUT",
+                        "raddino_patchpool_embeddings_episode.pt")),
                         map_location="cpu", weights_only=False)
         have = set(map(str, pp.keys()))
         inst = inst[inst.dicom_id.astype(str).isin(have)].reset_index(drop=True)

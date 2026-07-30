@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PC = os.path.join(PROJ, "pretrained_checkpoints")
-OUT = os.path.join(PC, "raddino_patchpool_embeddings.pt")
+OUT = os.path.join(PC, os.environ.get("PATCHPOOL_OUT", "raddino_patchpool_embeddings.pt"))
 SEG_S = 512
 THRESH = 0.5
 BATCH = 16
@@ -62,9 +62,30 @@ def main():
     _INST = os.environ.get("CXR_INSTANCES", "cxr_instances.csv")  # episode rebuild: cxr_instances_episode.csv
     inst = pd.read_csv(os.path.join(PC, _INST))
     inst = inst[inst.view_position.isin(["PA", "AP"])].reset_index(drop=True)
-    log.info("Frontal instances: %d | device=%s", len(inst), device)
 
-    emb = {}; nfail = 0; nfallback = 0
+    # Resume: at 60k images this is a multi-hour GPU job, so load any embeddings
+    # already saved and skip those dicoms. A timed-out job just resubmits and
+    # continues from the last checkpoint.
+    emb = {}
+    if os.path.exists(OUT):
+        try:
+            emb = torch.load(OUT, map_location="cpu", weights_only=False)
+            log.info("resume: loaded %d existing embeddings from %s", len(emb), OUT)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not load %s (%s) — starting fresh", OUT, e)
+    n_before = len(inst)
+    inst = inst[~inst.dicom_id.astype(str).isin(set(emb.keys()))].reset_index(drop=True)
+    log.info("Frontal instances: %d to do (%d already done) | device=%s",
+             len(inst), n_before - len(inst), device)
+
+    SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "4000"))
+
+    def _checkpoint():
+        tmp = OUT + ".tmp"
+        torch.save(emb, tmp)
+        os.replace(tmp, OUT)   # atomic: a kill mid-save never corrupts OUT
+
+    nfail = 0; nfallback = 0; last_saved = len(emb)
     with torch.no_grad():
         for start in range(0, len(inst), BATCH):
             b = inst.iloc[start:start + BATCH]
@@ -104,7 +125,10 @@ def main():
             if start % (BATCH * 20) == 0:
                 log.info("  %d/%d (emb=%d fallback=%d fail=%d)", start + len(b), len(inst),
                          len(emb), nfallback, nfail)
-    torch.save(emb, OUT)
+            if len(emb) - last_saved >= SAVE_EVERY:
+                _checkpoint(); last_saved = len(emb)
+                log.info("  checkpoint: %d embeddings saved", len(emb))
+    _checkpoint()
     log.info("Saved %d -> %s (mask-fallbacks=%d fail=%d)", len(emb), OUT, nfallback, nfail)
 
 
