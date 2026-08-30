@@ -123,7 +123,9 @@ This is the same conclusion the previous reports reached at n = 522, now on 35×
 | Root ≥4.5 | 90 / 0.4% | 0.854 | 0.024 [0.016, 0.040] | +0.012 [0.003, 0.025] |
 | Ascending ≥4.5 | 124 / 0.7% | 0.856 | 0.067 [0.039, 0.134] | +0.051 [0.024, 0.116] |
 
-AUPRC on the ≥4.0 endpoints is ~4× the prevalence line and roughly doubles the clinical floor on the ascending aorta — a real gain. But the ≥4.5 endpoints expose the AUROC trap starkly: **ascending ≥4.5 has AUROC 0.856 and AUPRC 0.067 against a prevalence of 0.007** — strong ranking, weak precision. AUROC alone would badly oversell the sparse endpoints.
+AUPRC on the ≥4.0 endpoints is ~4× the prevalence line and roughly doubles the clinical floor on the ascending aorta. The ≥4.5 endpoints have low *absolute* AUPRC but the **highest relative lift**: ascending ≥4.5 reaches AUPRC 0.067 against a prevalence of 0.007 — roughly a **10× enrichment over chance**, the strongest relative signal of any endpoint (root ≥4.5 ≈ 6×). The lesson is that AUPRC belongs *alongside* AUROC — both carry real information at these prevalences — not that either is dispensable or that the sparse endpoints are weak.
+
+> *Correction (aligned with `PROGRESS_UPDATE_2026-08-04.md` §7.2, 2026-08-13): an earlier draft read ascending ≥4.5 as an "AUROC trap" masking a worthless endpoint. That reading is withdrawn — at ~10× chance lift it is our strongest endpoint in relative terms.*
 
 ### 4.2 Confusion matrices at three operating points
 
@@ -162,7 +164,7 @@ The regression that drives the scoring is well-centred: bias +0.000 cm (root) / 
 
 - **The multimodal design question is now settled with evidence.** "Which modalities?" has a measured answer: CXR and EHR, each contributing significantly (previous report), and ECG excluded because its incremental value is +0.001–0.005 on 18,107 episodes. The two-modality model is a decision, not a default.
 - **The redundancy is structural, not accidental.** ECG-alone at 0.67 confirms the modality has aortic signal; the near-zero increment confirms that signal lives in the span of body-size + silhouette. This is a cleaner statement of the "modalities are largely redundant per site" theme than anything at n = 522.
-- **AUROC is now demonstrably insufficient for this problem.** The ascending ≥4.5 endpoint — AUROC 0.856, AUPRC 0.067 at prevalence 0.007 — is the single clearest case. Every headline AUROC in the manuscript needs an AUPRC and an operating point beside it.
+- **Report AUPRC and an operating point alongside every AUROC.** At these prevalences the two metrics are complementary: absolute AUPRC is modest, but the relative lift is largest exactly at the sparsest endpoints (ascending ≥4.5 ≈ 10× chance — our strongest endpoint in relative terms, not a weak one). Neither metric alone tells the whole story, so every headline AUROC in the manuscript is paired with an AUPRC and an operating point.
 - **The screening claim has to be a triage claim.** No operating point delivers both high sensitivity and usable precision at 4.5% prevalence; the top-5% enrichment (~5×, NNE ~4) is the framing the numbers actually support.
 
 ---
