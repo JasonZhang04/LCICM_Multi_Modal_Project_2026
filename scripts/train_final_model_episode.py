@@ -193,7 +193,7 @@ def main():
                              "diam_true": d[i], "pred_final": d_fin[i], "pred_geom_stack": d_geo[i],
                              "pred_floor": d_ehr[i]})
 
-    out_dir = os.path.join(ROOT, "outputs", "final_model_episode"); os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.join(ROOT, "outputs", os.environ.get("OUT_DIR", "final_model_episode")); os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
     pd.DataFrame(oof_rows).to_csv(os.path.join(out_dir, "oof_predictions.csv"), index=False)
