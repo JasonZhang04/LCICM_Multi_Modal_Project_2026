@@ -81,8 +81,8 @@ def main():
     tr_idx = np.array([row_of[e] for e in tr_eids]); ho_idx = np.array([row_of[e] for e in ho_eids])
 
     # fine-tuned CXR + ECG holdout predictions
-    cxr_ft = load_site(os.path.join(ROOT, "outputs", "cxr_finetune_holdout", "oof_predictions.csv"), "pred_cxr_ft")
-    ecg = load_site(os.path.join(ROOT, "outputs", "ecg_waveform_holdout", "oof_predictions.csv"), "pred_ecg_waveform")
+    cxr_ft = load_site(os.path.join(ROOT, "outputs", "cxr_finetune_episode_holdout", "oof_predictions.csv"), "pred_cxr_ft")
+    ecg = load_site(os.path.join(ROOT, "outputs", "ecg_waveform_episode_holdout", "oof_predictions.csv"), "pred_ecg_waveform")
 
     results = {"k_pca": gs.K, "n_holdout": len(ho_eids), "sites": {}}
     for site in ("root", "asc"):
