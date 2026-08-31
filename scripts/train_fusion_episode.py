@@ -38,13 +38,23 @@ import train_modality_value_episode as mv           # build_episode_cxr, _hgb, G
 
 
 def _pca_std(train, test, k):
-    """Fit PCA(k)+standardize on train rows, apply to both. NaN rows -> handled by caller."""
+    """Fit PCA(k)+standardize on the PRESENT (non-NaN) train rows only, apply to both;
+    rows with any NaN feature (e.g. episodes lacking an ECG embedding) map to the
+    standardized mean (0). Leakage-safe: the transform is fit on training rows only."""
     from sklearn.decomposition import PCA
     from sklearn.preprocessing import StandardScaler
-    pca = PCA(min(k, train.shape[1], max(train.shape[0] - 1, 1)), random_state=0).fit(train)
-    tr, te = pca.transform(train), pca.transform(test)
-    sc = StandardScaler().fit(tr)
-    return sc.transform(tr).astype(np.float32), sc.transform(te).astype(np.float32)
+    fin = ~np.isnan(train).any(1)
+    Xtr = train[fin]
+    pca = PCA(min(k, Xtr.shape[1], max(Xtr.shape[0] - 1, 1)), random_state=0).fit(Xtr)
+    sc = StandardScaler().fit(pca.transform(Xtr))
+
+    def emb(X):
+        out = np.zeros((X.shape[0], sc.mean_.shape[0]), np.float32)   # missing -> mean 0
+        m = ~np.isnan(X).any(1)
+        if m.any():
+            out[m] = sc.transform(pca.transform(X[m])).astype(np.float32)
+        return out
+    return emb(train), emb(test)
 
 
 def _std(train, test):
@@ -73,8 +83,13 @@ def coop_predict(blocks_tr, ytr, blocks_te, rho, lam):
     fusion (concatenated ridge); large rho forces the per-view predictions to agree."""
     from sklearn.linear_model import Ridge
     K_ = len(blocks_tr); n = blocks_tr[0].shape[0]; dims = [b.shape[1] for b in blocks_tr]
+    # Center y and drop the intercept: fit_intercept=True would fit the intercept over the
+    # zero-target agreement rows too, dragging it toward 0 as rho grows. Since every block is
+    # standardized (mean~0), the intercept is the only carrier of y's mean, so that would
+    # collapse predictions for rho>0. Centering y + fit_intercept=False is the correct form.
+    ybar = float(ytr.mean())
     Xcat_tr = np.hstack(blocks_tr)
-    A_rows, b_rows = [Xcat_tr], [ytr]
+    A_rows, b_rows = [Xcat_tr], [ytr - ybar]
     if rho > 0:
         sr = np.sqrt(rho)
         for i in range(K_):
@@ -84,8 +99,8 @@ def coop_predict(blocks_tr, ytr, blocks_te, rho, lam):
                 blk[:, ci:ci + dims[i]] = sr * blocks_tr[i]
                 blk[:, cj:cj + dims[j]] = -sr * blocks_tr[j]
                 A_rows.append(blk); b_rows.append(np.zeros(n, np.float32))
-    m = Ridge(alpha=lam).fit(np.vstack(A_rows), np.concatenate(b_rows))
-    return m.predict(np.hstack(blocks_te))
+    m = Ridge(alpha=lam, fit_intercept=False).fit(np.vstack(A_rows), np.concatenate(b_rows))
+    return m.predict(np.hstack(blocks_te)) + ybar
 
 
 def gbdt_scalar_oof(folds, y, block_fn, row_of, use_blocks):
@@ -121,10 +136,11 @@ def late_ridge_oof(folds, y, d_mods, row_of):
     return out
 
 
-def coop_oof(folds, y, block_fn, row_of, use_blocks):
-    """Cooperative-learning OOF with inner-CV rho/lambda selection (patient-agnostic inner
-    KFold on the training fold, since blocks are already leakage-safe per outer fold)."""
-    from sklearn.model_selection import KFold
+def coop_oof(folds, y, block_fn, row_of, use_blocks, sid):
+    """Cooperative-learning OOF with inner-CV rho/lambda selection. Inner CV is
+    PATIENT-GROUPED (GroupKFold on subject_id) so the selected (rho, lambda) is not
+    optimistically chosen on a patient's own straddling episodes."""
+    from sklearn.model_selection import GroupKFold
     from multimodal_aorta.training.bootstrap import r2
     out = np.full(len(y), np.nan); chosen = []
     for tr_eids, te_eids in folds:
@@ -135,12 +151,12 @@ def coop_oof(folds, y, block_fn, row_of, use_blocks):
             continue
         Btr, Bte = block_fn(trm, te)
         Btr = [Btr[i] for i in use_blocks]; Bte = [Bte[i] for i in use_blocks]
-        ytr = y[trm]
+        ytr = y[trm]; gtr = sid[trm]
         best, best_cfg = -1e9, (0.0, 10.0)
         for rho in RHO_GRID:
             for lam in LAM_GRID:
                 sc = []
-                for a, b in KFold(3, shuffle=True, random_state=0).split(trm):
+                for a, b in GroupKFold(3).split(trm, groups=gtr):
                     p = coop_predict([bl[a] for bl in Btr], ytr[a], [bl[b] for bl in Btr], rho, lam)
                     sc.append(r2(ytr[b], p))
                 s = float(np.mean(sc))
@@ -196,7 +212,7 @@ def main():
             acc["late3"].append(late_ridge_oof(folds, d, [d_cxr, d_ehr, d_ecg], row_of))
             acc["early2"].append(gbdt_scalar_oof(folds, d, block_fn, row_of, CXR_EHR))
             acc["early3"].append(gbdt_scalar_oof(folds, d, block_fn, row_of, CXR_EHR_ECG))
-            c3, rhos = coop_oof(folds, d, block_fn, row_of, CXR_EHR_ECG)
+            c3, rhos = coop_oof(folds, d, block_fn, row_of, CXR_EHR_ECG, sid)
             acc["coop3"].append(c3); coop_rhos += rhos
         P = {k: np.nanmean(np.column_stack(v), 1) for k, v in acc.items()}
         # evaluate ECG-including arms on ECG-having episodes; 2-mod on all
