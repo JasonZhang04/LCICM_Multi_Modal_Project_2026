@@ -91,15 +91,13 @@ def main():
         d_ehr = np.full(len(eids), np.nan); d_ehr[ho_idx] = hgb_split(X_ehr[tr_idx], d[tr_idx], X_ehr[ho_idx])
         d_ft = np.array([cxr_ft[site].get(e, np.nan) for e in eids])
         d_eg = np.array([ecg[site].get(e, np.nan) for e in eids])
-        # ensemble = mean of z-scored base diameters (z-scored over holdout episodes present)
+        # ensemble = mean of the base-learner cm predictions. Each base learner already predicts
+        # the diameter in cm, so the blend stays in cm (R2 is meaningful) and a weak/shrunk arm
+        # (e.g. ECG, which regresses toward the mean) is naturally down-weighted rather than
+        # inflated to unit variance. Redundant modalities -> a fixed equal blend ~= the
+        # regularized linear fusion, and needs no train-era base OOF, keeping the holdout clean.
         base = [d_cxr, d_ft, d_ehr, d_eg]
-        Z = []
-        for b in base:
-            bb = b.copy(); mask = ~np.isnan(bb)
-            if mask.sum() > 2:
-                bb = (bb - np.nanmean(bb[ho_idx])) / (np.nanstd(bb[ho_idx]) + 1e-9)
-            Z.append(bb)
-        ens = np.nanmean(np.column_stack(Z), axis=1)
+        ens = np.nanmean(np.column_stack(base), axis=1)
         m = (hold_arr == 1) & ~np.isnan(d) & ~np.isnan(ens) & ~np.isnan(d_ehr); g = sid[m]
         yy = y40[m]
         sr = {

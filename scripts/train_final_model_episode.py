@@ -125,8 +125,9 @@ def main():
         e = floor[(floor.site == site) & (floor.endpoint == "diam")]
         m = dict(zip(e.episode_id, e.pred_value)); return np.array([m.get(x, np.nan) for x in eids])
 
-    # --- ECG waveform embedding ---
-    ew = os.path.join(ROOT, "outputs", "ecg_waveform_episode")
+    # --- ECG waveform embedding --- (ECG_DIR=..._broad to use the broader-cohort-trained CNN;
+    # its OOF is on the same immutable folds for the CXR-cohort episodes, so it joins identically)
+    ew = os.path.join(ROOT, "outputs", os.environ.get("ECG_DIR", "ecg_waveform_episode"))
     E = np.load(os.path.join(ew, "ecg_embeddings.npy")); eix = pd.read_csv(os.path.join(ew, "ecg_embedding_index.csv"))
     X_ecg = np.full((len(eids), E.shape[1]), np.nan, np.float32)
     for r, e in zip(E, eix.episode_id.astype(str)):
