@@ -131,7 +131,21 @@ At n=522 PCA-32 was essential overfitting control; at ~16k it under-uses the emb
 
 **Cross-attention — tested directly, and it does not help.** A small regularized cross-attention block over the three modality tokens, run head-to-head against linear early fusion on the same folds, is statistically indistinguishable from it: root R² −0.002 [−0.005, 0.001], asc −0.001 [−0.005, 0.003] (both CIs include zero; AUROC likewise). So the claim that letting the modalities attend to each other adds nothing over simple linear fusion now rests on **direct evidence**, not just the cooperative-learning ρ=0 inference — as predicted for redundant modalities.
 
-**Fine-tuning — the ECG was trained from scratch; the CXR was not.** The waveform ECG model is trained end-to-end on our task (not a frozen embedding). RAD-DINO, however, is frozen — and the PCA saturation above shows that caps the CXR contribution. Partial fine-tuning of RAD-DINO (unfreeze the last blocks + a regression head, image-level, nested-in-fold) is now under way as the main performance lever, feasible at 16k patients / 60k images where it was not at 522. Result to follow.
+**Fine-tuning — the ECG was trained from scratch; fine-tuning the CXR is the biggest performance lever we found.** The waveform ECG model is already trained end-to-end. RAD-DINO was frozen, and the PCA saturation above showed that caps the CXR contribution — so we partial-fine-tuned it (unfreeze the last 2 ViT blocks + a regression head, whole-image, image-level nested-in-fold OOF on the immutable folds). **It beats the frozen embedding**, CXR-alone, decisively for ascending:
+
+| CXR-alone (same folds) | frozen (patchpool + geometry + HGB) | fine-tuned (last 2 blocks, whole image) |
+|---|---|---|
+| root R² / ge40 | 0.309 / 0.829 | **0.319 / 0.840** |
+| asc R² / ge40 | 0.304 / 0.817 | **0.333 / 0.833** |
+
+Notably, the fine-tuned model uses only the whole image — **no mask-pooling, no geometry** — yet beats the hand-engineered frozen pipeline, confirming the frozen representation was leaving aortic signal unused. Folded into the final model (as an added CXR scalar, on the fold-matched immutable partition per §6's leakage note), it is our **new best model**:
+
+| Integrated final (fine-tuned CXR + frozen CXR-128 + EHR + ECG) | vs EHR floor | vs geometry-stack |
+|---|---|---|
+| root R² 0.331 / ge40 0.838 | +0.061 / +0.054 \* | +0.008 / +0.007 \* |
+| asc R² 0.334 / ge40 0.830 | +0.126 / +0.105 \* | +0.020 / +0.015 \* |
+
+Versus the 5-Aug headline (root 0.826/0.316; asc 0.808/0.306) the full pipeline now reaches **root ge40 0.838 / R² 0.331, asc 0.830 / 0.334** — ~58–59% of the ~0.56–0.58 label-noise ceiling (up from ~53–57%). Fine-tuning was the single largest lever, and it landed on the ascending aorta, as the anatomy predicts.
 
 ---
 
