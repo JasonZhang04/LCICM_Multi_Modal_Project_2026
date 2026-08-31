@@ -25,6 +25,7 @@ PC = os.path.join(ROOT, "pretrained_checkpoints")
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 SMOKE = os.environ.get("SMOKE", "0") == "1"
+HOLDOUT = os.environ.get("HOLDOUT", "0") == "1"   # temporal train-era -> holdout-era split
 SEED = int(os.environ.get("SEED", "42"))
 FT_BLOCKS = int(os.environ.get("FT_BLOCKS", "2"))          # unfreeze the last FT_BLOCKS of 12
 BATCH = int(os.environ.get("BATCH", "32"))
@@ -65,6 +66,12 @@ def main():
     inst["fold_id"] = inst.episode_id.map(fold)
     inst["root"] = inst.episode_id.map(root_of); inst["asc"] = inst.episode_id.map(asc_of)
     inst = inst[inst.fold_id.notna()].reset_index(drop=True)
+    if HOLDOUT:                                  # temporal split: train-era -> holdout-era
+        hmap = pd.read_csv(os.path.join(PC, "episode_temporal_holdout.csv")).set_index("episode_id")["holdout"]
+        inst["fold_id"] = inst.episode_id.map(hmap.to_dict())   # 0=train-era, 1=holdout-era
+        inst = inst[inst.fold_id.notna()].reset_index(drop=True)
+        log.info("HOLDOUT mode: train-era %d imgs, holdout-era %d imgs",
+                 int((inst.fold_id == 0).sum()), int((inst.fold_id == 1).sum()))
 
     # Fast path: read the preprocessed 224x224 tensors from the memmap cache instead of
     # decoding a JPG per image per epoch. Falls back to load_cxr if the cache is absent.
@@ -99,6 +106,7 @@ def main():
 
     folds = sorted(inst.fold_id.unique())
     if SMOKE: folds = folds[:1]
+    if HOLDOUT: folds = [1]                       # predict holdout-era, train on train-era only
     oof = {"root": {}, "asc": {}}                                    # episode_id -> list of image preds
     for k in folds:
         tr_df = inst[inst.fold_id != k]; te_df = inst[inst.fold_id == k].reset_index(drop=True)
@@ -159,7 +167,8 @@ def main():
         log.info("fold %d done (fit imgs %d, test imgs %d)", k, len(fit_df), len(te_df))
 
     # aggregate image preds -> episode, evaluate + save
-    out_dir = os.path.join(ROOT, "outputs", "cxr_finetune_episode" + ("_smoke" if SMOKE else ""))
+    out_dir = os.path.join(ROOT, "outputs", "cxr_finetune_episode" +
+                           ("_smoke" if SMOKE else "_holdout" if HOLDOUT else ""))
     os.makedirs(out_dir, exist_ok=True)
     rows, res = [], {"seed": SEED, "ft_blocks": FT_BLOCKS, "smoke": SMOKE, "sites": {}}
     sid_of = dict(zip(ep.episode_id.astype(str), ep.subject_id))

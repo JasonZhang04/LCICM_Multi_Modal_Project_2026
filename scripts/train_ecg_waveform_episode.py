@@ -24,6 +24,7 @@ PC = os.path.join(ROOT, "pretrained_checkpoints")
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 SMOKE = os.environ.get("SMOKE", "0") == "1"
+HOLDOUT = os.environ.get("HOLDOUT", "0") == "1"   # temporal train-era -> holdout-era
 SEED = int(os.environ.get("SEED", "42"))
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "200" if SMOKE else "12000"))
 WARMUP = 200 if SMOKE else 2000
@@ -48,8 +49,13 @@ def main():
     row_of_study = dict(zip(idx.study_id, idx.row))
     coh = coh[coh.study_id.isin(row_of_study)].reset_index(drop=True)
     coh["wrow"] = coh.study_id.map(row_of_study).astype(int)
+    if HOLDOUT:                                  # temporal split: train-era -> holdout-era
+        hmap = pd.read_csv(os.path.join(PC, "episode_temporal_holdout.csv")).set_index("episode_id")["holdout"]
+        coh["fold_id"] = coh.episode_id.astype(str).map(hmap.to_dict())
+        coh = coh[coh.fold_id.notna()].reset_index(drop=True); coh["fold_id"] = coh.fold_id.astype(int)
+        log.info("HOLDOUT mode: train-era %d, holdout-era %d", int((coh.fold_id == 0).sum()), int((coh.fold_id == 1).sum()))
     waves = np.load(os.path.join(PC, "ecg_waveforms.npy"), mmap_mode="r")   # (N,12,5000) f16
-    log.info("cohort %d episodes | waveforms %s | device %s | SMOKE=%s", len(coh), waves.shape, dev, SMOKE)
+    log.info("cohort %d episodes | waveforms %s | device %s | SMOKE=%s HOLDOUT=%s", len(coh), waves.shape, dev, SMOKE, HOLDOUT)
 
     class DS(Dataset):
         def __init__(self, df, tmean, tstd, train):
@@ -69,6 +75,7 @@ def main():
             return torch.from_numpy(x), torch.from_numpy(self.Z[i]), torch.from_numpy(self.mask[i])
 
     folds = sorted(coh.fold_id.unique())
+    if HOLDOUT: folds = [1]                       # predict holdout-era, train on train-era only
     if SMOKE:
         folds = folds[:1]
     oof = {t: np.full(len(coh), np.nan) for t in ("root_cm", "asc_cm")}
@@ -139,7 +146,7 @@ def main():
         log.info("fold %d done (train %d val %d test %d)", k, len(fit_df), len(val_df), len(te_df))
 
     # save OOF + standalone metrics
-    out_dir = os.path.join(ROOT, "outputs", "ecg_waveform_episode" + ("_smoke" if SMOKE else ""))
+    out_dir = os.path.join(ROOT, "outputs", "ecg_waveform_episode" + ("_smoke" if SMOKE else "_holdout" if HOLDOUT else ""))
     os.makedirs(out_dir, exist_ok=True)
     rows, res = [], {"seed": SEED, "smoke": SMOKE, "sites": {}}
     for site, col in (("root", "root_cm"), ("asc", "asc_cm")):
