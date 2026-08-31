@@ -65,18 +65,36 @@ def main():
     inst["fold_id"] = inst.episode_id.map(fold)
     inst["root"] = inst.episode_id.map(root_of); inst["asc"] = inst.episode_id.map(asc_of)
     inst = inst[inst.fold_id.notna()].reset_index(drop=True)
+
+    # Fast path: read the preprocessed 224x224 tensors from the memmap cache instead of
+    # decoding a JPG per image per epoch. Falls back to load_cxr if the cache is absent.
+    cache_path = os.path.join(PC, "cxr_image_cache.npy")
+    CACHE = crow_of = None
+    if os.path.exists(cache_path):
+        CACHE = np.load(cache_path, mmap_mode="r")
+        cidx = pd.read_csv(os.path.join(PC, "cxr_image_cache_index.csv"))
+        crow_of = dict(zip(cidx.dicom_id.astype(str), cidx.row))
+        inst["crow"] = inst.dicom_id.map(crow_of)
+        inst = inst[inst.crow.notna()].reset_index(drop=True); inst["crow"] = inst.crow.astype(int)
+        log.info("using image cache %s", CACHE.shape)
     log.info("image rows %d | episodes %d | device %s | FT_BLOCKS=%d SMOKE=%s",
              len(inst), inst.episode_id.nunique(), dev, FT_BLOCKS, SMOKE)
 
     class DS(Dataset):
         def __init__(self, df, tmean, tstd, train):
             self.p = df.cxr_path.to_numpy(); self.eid = df.episode_id.to_numpy()
+            self.crow = df.crow.to_numpy() if CACHE is not None else None
             self.Y = df[["root", "asc"]].to_numpy(np.float32)
             self.Z = np.nan_to_num((self.Y - tmean) / tstd, nan=0.0)
             self.mask = (~np.isnan(self.Y)).astype(np.float32); self.train = train
         def __len__(self): return len(self.p)
         def __getitem__(self, i):
-            x = load_cxr(self.p[i], cfg.data, is_train=self.train)     # (3,H,W)
+            if CACHE is not None:
+                x = torch.from_numpy(np.asarray(CACHE[self.crow[i]], dtype=np.float32))
+                if self.train:
+                    x = x + torch.randn_like(x) * 0.02                 # light augmentation
+            else:
+                x = load_cxr(self.p[i], cfg.data, is_train=self.train)  # (3,H,W)
             return x, torch.from_numpy(self.Z[i]), torch.from_numpy(self.mask[i]), i
 
     folds = sorted(inst.fold_id.unique())

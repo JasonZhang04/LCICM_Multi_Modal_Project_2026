@@ -4,7 +4,7 @@ Is the PCA-32 on the frozen CXR embeddings helping or hurting at episode scale?
 At n=522 PCA-32 was the biggest cheap win (overfitting control). At ~16k episodes the
 overfitting pressure is far lower, so PCA-32 might now be an information bottleneck. This
 sweeps the CXR base learner's out-of-fold diameter R^2 over PCA dimensionality
-(16 / 32 / 64 / 128 / 768=no-reduction) with everything else fixed, single seed.
+(16 / 32 / 64 / 128 / 768=full-rank rotation, not raw features) with everything else fixed, single seed.
 
 Reuses train_geometry_stack_episode.cxr_base_oof (the multi-instance CXR diameter
 regressor); gs.K is overridden per sweep value.
