@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 SMOKE = os.environ.get("SMOKE", "0") == "1"
 HOLDOUT = os.environ.get("HOLDOUT", "0") == "1"   # temporal train-era -> holdout-era
+BROAD = os.environ.get("BROAD", "0") == "1"       # broader ECG-only cohort (fold -1 = always-train)
 SEED = int(os.environ.get("SEED", "42"))
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "200" if SMOKE else "12000"))
 WARMUP = 200 if SMOKE else 2000
@@ -44,8 +45,11 @@ def main():
     torch.manual_seed(SEED); np.random.seed(SEED)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    coh = pd.read_csv(os.path.join(PC, "ecg_waveform_cohort.csv"))
-    idx = pd.read_csv(os.path.join(PC, "ecg_waveform_index.csv"))
+    coh_file = "ecg_waveform_cohort_broad.csv" if BROAD else "ecg_waveform_cohort.csv"
+    idx_file = "ecg_waveform_index_broad.csv" if BROAD else "ecg_waveform_index.csv"
+    npy_file = "ecg_waveforms_broad.npy" if BROAD else "ecg_waveforms.npy"
+    coh = pd.read_csv(os.path.join(PC, coh_file))
+    idx = pd.read_csv(os.path.join(PC, idx_file))
     row_of_study = dict(zip(idx.study_id, idx.row))
     coh = coh[coh.study_id.isin(row_of_study)].reset_index(drop=True)
     coh["wrow"] = coh.study_id.map(row_of_study).astype(int)
@@ -54,7 +58,7 @@ def main():
         coh["fold_id"] = coh.episode_id.astype(str).map(hmap.to_dict())
         coh = coh[coh.fold_id.notna()].reset_index(drop=True); coh["fold_id"] = coh.fold_id.astype(int)
         log.info("HOLDOUT mode: train-era %d, holdout-era %d", int((coh.fold_id == 0).sum()), int((coh.fold_id == 1).sum()))
-    waves = np.load(os.path.join(PC, "ecg_waveforms.npy"), mmap_mode="r")   # (N,12,5000) f16
+    waves = np.load(os.path.join(PC, npy_file), mmap_mode="r")   # (N,12,5000) f16
     log.info("cohort %d episodes | waveforms %s | device %s | SMOKE=%s HOLDOUT=%s", len(coh), waves.shape, dev, SMOKE, HOLDOUT)
 
     class DS(Dataset):
@@ -75,6 +79,7 @@ def main():
             return torch.from_numpy(x), torch.from_numpy(self.Z[i]), torch.from_numpy(self.mask[i])
 
     folds = sorted(coh.fold_id.unique())
+    if BROAD: folds = [f for f in folds if f >= 0]   # -1 = always-train, never a test fold
     if HOLDOUT: folds = [1]                       # predict holdout-era, train on train-era only
     if SMOKE:
         folds = folds[:1]
@@ -146,7 +151,7 @@ def main():
         log.info("fold %d done (train %d val %d test %d)", k, len(fit_df), len(val_df), len(te_df))
 
     # save OOF + standalone metrics
-    out_dir = os.path.join(ROOT, "outputs", "ecg_waveform_episode" + ("_smoke" if SMOKE else "_holdout" if HOLDOUT else ""))
+    out_dir = os.path.join(ROOT, "outputs", "ecg_waveform_episode" + ("_smoke" if SMOKE else "_holdout" if HOLDOUT else "_broad" if BROAD else ""))
     os.makedirs(out_dir, exist_ok=True)
     rows, res = [], {"seed": SEED, "smoke": SMOKE, "sites": {}}
     for site, col in (("root", "root_cm"), ("asc", "asc_cm")):

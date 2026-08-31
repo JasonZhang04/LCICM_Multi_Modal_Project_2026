@@ -27,10 +27,14 @@ L = 5000
 
 def main():
     import wfdb
-    coh = pd.read_csv(os.path.join(PC, "ecg_waveform_cohort.csv"))
+    BROAD = os.environ.get("BROAD", "0") == "1"          # broader ECG-only cohort
+    coh_file = "ecg_waveform_cohort_broad.csv" if BROAD else "ecg_waveform_cohort.csv"
+    npy_file = "ecg_waveforms_broad.npy" if BROAD else "ecg_waveforms.npy"
+    idx_file = "ecg_waveform_index_broad.csv" if BROAD else "ecg_waveform_index.csv"
+    coh = pd.read_csv(os.path.join(PC, coh_file))
     studies = coh.drop_duplicates("study_id")[["study_id", "ecg_path"]].reset_index(drop=True)
     n = len(studies)
-    log.info("caching %d unique ECG waveforms", n)
+    log.info("caching %d unique ECG waveforms (BROAD=%s)", n, BROAD)
 
     arr = np.zeros((n, 12, L), dtype=np.float16)
     nfail = 0
@@ -54,9 +58,9 @@ def main():
         if (i + 1) % 2000 == 0:
             log.info("  %d/%d (fail=%d)", i + 1, n, nfail)
 
-    np.save(os.path.join(PC, "ecg_waveforms.npy"), arr)
+    np.save(os.path.join(PC, npy_file), arr)
     studies.assign(row=np.arange(n))[["study_id", "row"]].to_csv(
-        os.path.join(PC, "ecg_waveform_index.csv"), index=False)
+        os.path.join(PC, idx_file), index=False)
     log.info("saved ecg_waveforms.npy %s (%.1f GB) + index | fail=%d",
              arr.shape, arr.nbytes / 1e9, nfail)
 
