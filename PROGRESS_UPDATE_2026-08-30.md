@@ -114,7 +114,28 @@ This is the deployable model, and it is *simple*: multi-instance CXR predicted d
 
 ---
 
-## 6. Where this leaves the paper
+## 6. Follow-up: four design questions (PCA, leakage, fusion completeness, fine-tuning)
+
+A review of the model raised four questions; each was answered directly.
+
+**PCA dimensionality (is 32 a bottleneck?) — yes, mildly, and fixed for free.** A sweep of the CXR base learner's OOF diameter R² over PCA dim (single seed) shows it rises then plateaus:
+
+| PCA dim | 16 | 32 | 64 | 128 | 768 (none) |
+|---|---|---|---|---|---|
+| root CXR-alone R² | 0.294 | 0.298 | 0.307 | **0.309** | 0.307 |
+| asc CXR-alone R² | 0.287 | 0.292 | 0.302 | **0.304** | 0.303 |
+
+At n=522 PCA-32 was essential overfitting control; at ~16k it under-uses the embedding. Moving to **K=128** lifts the final model from R² 0.326→**0.334** (root) and 0.314→**0.325** (asc), ge40 0.832→0.835 / 0.814→0.818 — a free gain now adopted. That no-PCA (768) does *not* beat 128 also means the frozen RAD-DINO representation **saturates around 128 effective dimensions** — so the only way past that ceiling is to update the backbone (fine-tuning, below).
+
+**Leakage between the ECG model and the multimodal model — none.** The ECG waveform model is trained under the same patient-grouped nested CV: each patient's ECG embedding is produced by a model that never saw that patient, so it is a pre-computed leakage-free feature (like the frozen CXR embeddings). An independent methods review confirmed the embedding is out-of-fold and that 0 patients span folds. (The two core fusion scripts were also review-audited; a cooperative-learning intercept bug and an ECG-NaN crash were caught and fixed before any result was trusted — §4.)
+
+**Cross-attention — being tested directly, not just predicted.** The cooperative-learning ρ=0 result already implies cross-modal interaction won't help (redundant modalities), and the literature agrees, but a small regularized cross-attention arm is being run head-to-head against linear early fusion so the claim rests on evidence, not inference. Result to follow.
+
+**Fine-tuning — the ECG was trained from scratch; the CXR was not.** The waveform ECG model is trained end-to-end on our task (not a frozen embedding). RAD-DINO, however, is frozen — and the PCA saturation above shows that caps the CXR contribution. Partial fine-tuning of RAD-DINO (unfreeze the last blocks + a regression head, image-level, nested-in-fold) is now under way as the main performance lever, feasible at 16k patients / 60k images where it was not at 522. Result to follow.
+
+---
+
+## 7. Where this leaves the paper
 
 - **Objective 1 (modality-value ablation) is essentially complete and coherent:** CXR carries most of the aortic signal, anatomically localized; EHR contributes body-size context; the ECG *summary* is redundant (TOST-equivalent), while the raw *waveform* adds a small unique R² increment; and the modalities are redundant rather than complementary, so simple linear early fusion is optimal (cooperative learning's ρ=0 confirms it).
 - **Objective 2 (the multimodal model)** is delivered as the integrated model in §5 — it significantly improves on the 5-Aug headline and has the clinical operating picture (AUPRC, confusion matrices, calibration, NNE) already in place from the 5 August work (to be regenerated on the final model's OOF).
