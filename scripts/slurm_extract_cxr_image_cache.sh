@@ -2,9 +2,9 @@
 #SBATCH --job-name=cxr_image_cache
 #SBATCH --partition=shared
 #SBATCH --account=rsteven1
-#SBATCH --time=01:00:00
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
+#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
 #SBATCH --output=logs/imgcache_%j.out
 #SBATCH --error=logs/imgcache_%j.err
 set -euo pipefail

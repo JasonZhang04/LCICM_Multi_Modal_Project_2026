@@ -27,7 +27,8 @@ SEED = int(os.environ.get("SEED", "42"))
 def main():
     from multimodal_aorta.data.episodes import load_episodes, make_episode_id
     from multimodal_aorta.data.splits import make_grouped_cv_folds
-    from multimodal_aorta.training.bootstrap import cluster_bootstrap_ci, r2, auroc, fmt
+    from multimodal_aorta.training.bootstrap import (
+        cluster_bootstrap_ci, paired_cluster_bootstrap_diff, r2, auroc, fmt)
     import torch
 
     ep = load_episodes(PC, require_ecg=False)
@@ -48,14 +49,23 @@ def main():
     for site in ("root", "asc"):
         d = diam[site]; y40 = np.where(np.isnan(d), np.nan, (d >= 4.0).astype(float))
         results["sites"][site] = {}
+        preds = {}
         for k in KS:
             gs.K = k                                    # override PCA dim used inside cxr_base_oof
             d_cxr = gs.cxr_base_oof(folds, d, blocks, Xgeom, I_eid, I_sid, Iw, row_of)
+            preds[k] = d_cxr
             m = ~np.isnan(d) & ~np.isnan(d_cxr); g = sid[m]
             r2c = fmt(cluster_bootstrap_ci(d[m], d_cxr[m], g, r2, need_both_classes=False))
             auc = fmt(cluster_bootstrap_ci(y40[m], d_cxr[m], g, auroc))
             results["sites"][site][str(k)] = {"cxr_r2": r2c, "cxr_ge40": auc}
             log.info("[%s] PCA K=%3d -> CXR-alone R2 %s | ge40 %s", site, k, r2c, auc)
+        # PAIRED delta-R2 (same episodes/folds, differ only by K) — the correct test for
+        # whether K=128 really beats K=32 (marginal CIs overlap; paired is far tighter).
+        if 128 in preds and 32 in preds:
+            m = ~np.isnan(d) & ~np.isnan(preds[128]) & ~np.isnan(preds[32])
+            dd = fmt(paired_cluster_bootstrap_diff(d[m], preds[128][m], preds[32][m], sid[m], r2, need_both_classes=False))
+            results["sites"][site]["r2_128_vs_32_paired"] = dd
+            log.info("[%s] PAIRED delta-R2 (K=128 - K=32): %s", site, dd)
     out_dir = os.path.join(ROOT, "outputs", "pca_sweep_episode"); os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)

@@ -11,8 +11,9 @@ Final integrated multimodal model: combine the three ablation winners.
     R^2 increment where the ECG measurement summary added nothing.
 
 Final = Ridge over [ d_cxr(multi-instance, OOF) | EHR 12 raw features | ECG-embedding PCA-32 ],
-nested patient-grouped OOF, scored by predicted diameter. Reported on ALL 20,682 episodes
-(ECG-missing -> ECG block imputed to 0) against two baselines on the same folds/episodes:
+nested patient-grouped OOF, scored by predicted diameter. Reported on the CXR-having,
+labelled episodes (~20,429 root / 18,510 asc; ECG-missing -> ECG block imputed to 0)
+against two baselines on the same folds/episodes:
   FLOOR         = EHR-only diameter (the clinical floor)
   GEOM_STACK    = the current headline: late ridge over [d_cxr, d_ehr]
 
@@ -29,6 +30,7 @@ PC = os.path.join(ROOT, "pretrained_checkpoints")
 sys.path.insert(0, os.path.join(ROOT, "src")); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 K = int(os.environ.get("K_PCA", "32"))
 SEEDS = [int(s) for s in os.environ.get("SEEDS", "1,2,3").split(",")]
+FOLD_MODE = os.environ.get("FOLD_MODE", "seeds")   # "seeds" | "immutable" (see main)
 EHR_COLS = ["age", "sex", "height_cm", "weight_kg", "bmi", "bsa", "sbp", "dbp",
             "height_missing", "weight_missing", "bsa_missing", "bp_missing"]
 import train_geometry_stack_episode as gs          # cxr_base_oof, load_instance_features, ridge_stack
@@ -54,11 +56,15 @@ def linear_early_oof(folds, y, d_cxr, X_ehr, X_ecg, row_of, sid):
             continue
         sc = StandardScaler().fit(np.nan_to_num(X_ehr[trm]))
         fin = ~np.isnan(X_ecg[trm]).any(1)
-        pca = PCA(min(K, X_ecg.shape[1], max(fin.sum() - 1, 1)), random_state=0).fit(X_ecg[trm][fin])
-        esc = StandardScaler().fit(pca.transform(X_ecg[trm][fin]))
+        use_ecg = fin.sum() >= K + 1            # guard: enough ECG-present train rows to PCA
+        if use_ecg:
+            pca = PCA(min(K, X_ecg.shape[1], fin.sum() - 1), random_state=0).fit(X_ecg[trm][fin])
+            esc = StandardScaler().fit(pca.transform(X_ecg[trm][fin]))
 
         def feat(idx):
             ehr = sc.transform(np.nan_to_num(X_ehr[idx])).astype(np.float32)
+            if not use_ecg:
+                return np.column_stack([d_cxr[idx], ehr])
             ec = np.zeros((len(idx), esc.mean_.shape[0]), np.float32)
             m = ~np.isnan(X_ecg[idx]).any(1)
             if m.any():
@@ -120,13 +126,24 @@ def main():
         if e in row_of: X_ecg[row_of[e]] = r
     log.info("episodes %d | CXR instances %d | ECG-emb %d", len(eids), len(inst), int((~np.isnan(X_ecg[:, 0])).sum()))
 
-    results = {"seeds": SEEDS, "sites": {}}; oof_rows = []
+    # FOLD_MODE: "seeds" = repeated CV over SEEDS (regenerated folds; fine when the
+    # precomputed OOF features cancel in paired diffs). "immutable" = the single immutable
+    # seed-42 partition, which MATCHES the folds the precomputed features (ECG embedding,
+    # EHR floor, and the fine-tuned CXR) were generated on — use this once the fine-tuned
+    # CXR is ingested, to avoid cross-scheme stacking optimism (review issue 1).
+    from multimodal_aorta.data.splits import load_episode_folds
+    if FOLD_MODE == "immutable":
+        fold_sets = [load_episode_folds(os.path.join(PC, "episode_fold_assignments.csv"))]
+        log.info("FOLD_MODE=immutable (single seed-42 partition, matched to precomputed OOF)")
+    else:
+        fold_sets = [make_grouped_cv_folds(ep, stratify_col="anyAD", n_splits=5, seed=s) for s in SEEDS]
+
+    results = {"seeds": SEEDS, "fold_mode": FOLD_MODE, "sites": {}}; oof_rows = []
     for site in ("root", "asc"):
         d = diam[site]; d_ehr = ehr_diam(site)
         y40 = np.where(np.isnan(d), np.nan, (d >= 4.0).astype(float))
         FIN, GEO, FLOOR = [], [], []
-        for seed in SEEDS:
-            folds = make_grouped_cv_folds(ep, stratify_col="anyAD", n_splits=5, seed=seed)
+        for folds in fold_sets:
             d_cxr = gs.cxr_base_oof(folds, d, blocks, Xgeom, I_eid, I_sid, Iw, row_of)
             GEO.append(gs.ridge_stack(np.column_stack([d_cxr, d_ehr]), d, folds, row_of))   # headline late fusion
             FIN.append(linear_early_oof(folds, d, d_cxr, X_ehr, X_ecg, row_of, sid))         # final linear early
