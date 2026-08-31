@@ -80,9 +80,12 @@ class ECGResNet(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.head = nn.Linear(channels[-1], n_out)
 
-    def forward(self, x):                        # x: (B, 12, 5000)
+    def forward(self, x, return_embedding=False):    # x: (B, 12, 5000)
         x = self.stem(x)
         x = self.stages(x)
         x = self.attn(x)
-        x = self.pool(x).squeeze(-1)             # (B, C)
-        return self.head(self.drop(x))           # (B, n_out)
+        emb = self.pool(x).squeeze(-1)               # (B, C) penultimate embedding
+        out = self.head(self.drop(emb))              # (B, n_out)
+        if return_embedding:
+            return out, emb
+        return out

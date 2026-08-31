@@ -72,6 +72,8 @@ def main():
     if SMOKE:
         folds = folds[:1]
     oof = {t: np.full(len(coh), np.nan) for t in ("root_cm", "asc_cm")}
+    EMB_DIM = 256                                    # ECGResNet penultimate width
+    emb_oof = np.full((len(coh), EMB_DIM), np.nan, dtype=np.float32)
     for k in folds:
         tr_df = coh[coh.fold_id != k]
         te_df = coh[coh.fold_id == k]
@@ -121,16 +123,19 @@ def main():
                     stop = True; break
 
         if best_state: model.load_state_dict(best_state)
-        # predict fold k
+        # predict fold k (scalar diameters + penultimate embedding), leakage-free OOF
         model.eval()
         pdl = DataLoader(DS(te_df, tmean, tstd, False), batch_size=128, num_workers=4)
-        preds = []
+        preds, embs = [], []
         with torch.no_grad():
             for x, z, m in pdl:
-                preds.append(model(x.to(dev)).cpu().numpy())
+                out, e = model(x.to(dev), return_embedding=True)
+                preds.append(out.cpu().numpy()); embs.append(e.cpu().numpy())
         P = np.concatenate(preds, 0) * tstd + tmean   # back to cm/bpm
+        E = np.concatenate(embs, 0)
         for j, t in enumerate(("root_cm", "asc_cm")):
             oof[t][te_df.index.to_numpy()] = P[:, j]
+        emb_oof[te_df.index.to_numpy()] = E
         log.info("fold %d done (train %d val %d test %d)", k, len(fit_df), len(val_df), len(te_df))
 
     # save OOF + standalone metrics
@@ -155,7 +160,12 @@ def main():
     pd.DataFrame(rows).to_csv(os.path.join(out_dir, "oof_predictions.csv"), index=False)
     with open(os.path.join(out_dir, "results.json"), "w") as f:
         json.dump(res, f, indent=2)
-    log.info("Saved -> %s", out_dir)
+    # per-episode OOF penultimate embedding (leakage-free) for feature-level fusion
+    has_emb = ~np.isnan(emb_oof[:, 0])
+    np.save(os.path.join(out_dir, "ecg_embeddings.npy"), emb_oof[has_emb].astype(np.float32))
+    coh.loc[has_emb, ["episode_id", "subject_id"]].to_csv(
+        os.path.join(out_dir, "ecg_embedding_index.csv"), index=False)
+    log.info("Saved -> %s (+ ecg_embeddings.npy %s)", out_dir, emb_oof[has_emb].shape)
 
 
 if __name__ == "__main__":
