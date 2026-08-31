@@ -32,6 +32,7 @@ K = int(os.environ.get("K_PCA", "32"))
 SEEDS = [int(s) for s in os.environ.get("SEEDS", "1,2,3").split(",")]
 FOLD_MODE = os.environ.get("FOLD_MODE", "seeds")   # "seeds" | "immutable" (see main)
 USE_CXR_FT = os.environ.get("USE_CXR_FT", "0") == "1"   # add the fine-tuned CXR scalar
+K_ECG = int(os.environ.get("K_ECG", "32"))              # ECG-embedding PCA dim (fixed, small)
 EHR_COLS = ["age", "sex", "height_cm", "weight_kg", "bmi", "bsa", "sbp", "dbp",
             "height_missing", "weight_missing", "bsa_missing", "bp_missing"]
 import train_geometry_stack_episode as gs          # cxr_base_oof, load_instance_features, ridge_stack
@@ -57,9 +58,11 @@ def linear_early_oof(folds, y, d_cxr, X_ehr, X_ecg, row_of, sid, d_cxr_ft=None):
             continue
         sc = StandardScaler().fit(np.nan_to_num(X_ehr[trm]))
         fin = ~np.isnan(X_ecg[trm]).any(1)
-        use_ecg = fin.sum() >= K + 1            # guard: enough ECG-present train rows to PCA
+        # ECG-embedding PCA dim is FIXED and small (decoupled from the CXR K_PCA sweep):
+        # the embedding is a 256-d small-CNN output; PCA-128 there overfits the linear ridge.
+        use_ecg = fin.sum() >= K_ECG + 1        # guard: enough ECG-present train rows to PCA
         if use_ecg:
-            pca = PCA(min(K, X_ecg.shape[1], fin.sum() - 1), random_state=0).fit(X_ecg[trm][fin])
+            pca = PCA(min(K_ECG, X_ecg.shape[1], fin.sum() - 1), random_state=0).fit(X_ecg[trm][fin])
             esc = StandardScaler().fit(pca.transform(X_ecg[trm][fin]))
 
         def feat(idx):
