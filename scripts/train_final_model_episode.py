@@ -31,12 +31,13 @@ sys.path.insert(0, os.path.join(ROOT, "src")); sys.path.insert(0, os.path.dirnam
 K = int(os.environ.get("K_PCA", "32"))
 SEEDS = [int(s) for s in os.environ.get("SEEDS", "1,2,3").split(",")]
 FOLD_MODE = os.environ.get("FOLD_MODE", "seeds")   # "seeds" | "immutable" (see main)
+USE_CXR_FT = os.environ.get("USE_CXR_FT", "0") == "1"   # add the fine-tuned CXR scalar
 EHR_COLS = ["age", "sex", "height_cm", "weight_kg", "bmi", "bsa", "sbp", "dbp",
             "height_missing", "weight_missing", "bsa_missing", "bp_missing"]
 import train_geometry_stack_episode as gs          # cxr_base_oof, load_instance_features, ridge_stack
 
 
-def linear_early_oof(folds, y, d_cxr, X_ehr, X_ecg, row_of, sid):
+def linear_early_oof(folds, y, d_cxr, X_ehr, X_ecg, row_of, sid, d_cxr_ft=None):
     """Nested-OOF regularized LINEAR early fusion: per fold, standardize EHR + PCA the ECG
     embedding on the training rows only, concat with the (already-OOF) multi-instance CXR
     scalar, fit a Ridge (alpha by inner MAE CV), predict the held-out fold. ECG-missing rows
@@ -62,14 +63,17 @@ def linear_early_oof(folds, y, d_cxr, X_ehr, X_ecg, row_of, sid):
             esc = StandardScaler().fit(pca.transform(X_ecg[trm][fin]))
 
         def feat(idx):
-            ehr = sc.transform(np.nan_to_num(X_ehr[idx])).astype(np.float32)
-            if not use_ecg:
-                return np.column_stack([d_cxr[idx], ehr])
-            ec = np.zeros((len(idx), esc.mean_.shape[0]), np.float32)
-            m = ~np.isnan(X_ecg[idx]).any(1)
-            if m.any():
-                ec[m] = esc.transform(pca.transform(X_ecg[idx][m])).astype(np.float32)
-            return np.column_stack([d_cxr[idx], ehr, ec])
+            cols = [d_cxr[idx]]
+            if d_cxr_ft is not None:                     # add the fine-tuned CXR scalar
+                cols.append(np.nan_to_num(d_cxr_ft[idx], nan=float(np.nanmean(d_cxr_ft[trm]))))
+            cols.append(sc.transform(np.nan_to_num(X_ehr[idx])).astype(np.float32))
+            if use_ecg:
+                ec = np.zeros((len(idx), esc.mean_.shape[0]), np.float32)
+                m = ~np.isnan(X_ecg[idx]).any(1)
+                if m.any():
+                    ec[m] = esc.transform(pca.transform(X_ecg[idx][m])).astype(np.float32)
+                cols.append(ec)
+            return np.column_stack(cols)
 
         Ftr, Fte = feat(trm), feat(tem)
         ytr = y[trm]; gtr = sid[trm]
@@ -126,6 +130,17 @@ def main():
         if e in row_of: X_ecg[row_of[e]] = r
     log.info("episodes %d | CXR instances %d | ECG-emb %d", len(eids), len(inst), int((~np.isnan(X_ecg[:, 0])).sum()))
 
+    # optional fine-tuned CXR scalar (OOF on the immutable folds; use FOLD_MODE=immutable)
+    d_cxr_ft_map = {"root": None, "asc": None}
+    if USE_CXR_FT:
+        ft = pd.read_csv(os.path.join(ROOT, "outputs", "cxr_finetune_episode", "oof_predictions.csv"))
+        ft["episode_id"] = ft.episode_id.astype(str)
+        for s in ("root", "asc"):
+            fm = dict(zip(ft[ft.site == s].episode_id, ft[ft.site == s].pred_cxr_ft))
+            d_cxr_ft_map[s] = np.array([fm.get(x, np.nan) for x in eids])
+        log.info("USE_CXR_FT=1: fine-tuned CXR scalar added (present %d)",
+                 int((~np.isnan(d_cxr_ft_map['root'])).sum()))
+
     # FOLD_MODE: "seeds" = repeated CV over SEEDS (regenerated folds; fine when the
     # precomputed OOF features cancel in paired diffs). "immutable" = the single immutable
     # seed-42 partition, which MATCHES the folds the precomputed features (ECG embedding,
@@ -146,7 +161,8 @@ def main():
         for folds in fold_sets:
             d_cxr = gs.cxr_base_oof(folds, d, blocks, Xgeom, I_eid, I_sid, Iw, row_of)
             GEO.append(gs.ridge_stack(np.column_stack([d_cxr, d_ehr]), d, folds, row_of))   # headline late fusion
-            FIN.append(linear_early_oof(folds, d, d_cxr, X_ehr, X_ecg, row_of, sid))         # final linear early
+            FIN.append(linear_early_oof(folds, d, d_cxr, X_ehr, X_ecg, row_of, sid,
+                                        d_cxr_ft=d_cxr_ft_map[site]))                         # final linear early
         d_fin = np.nanmean(np.column_stack(FIN), 1); d_geo = np.nanmean(np.column_stack(GEO), 1)
         m = ~np.isnan(d) & ~np.isnan(d_fin) & ~np.isnan(d_geo) & ~np.isnan(d_ehr); g = sid[m]
         sr = {
