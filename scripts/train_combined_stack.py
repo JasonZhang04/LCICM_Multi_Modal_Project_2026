@@ -1,7 +1,7 @@
 """
 Combined late-fusion stack — the best multimodal model as of 2026-07-16.
 
-Combines every win from notes/experiments_2026-07-16.md:
+Combines every win from notes/archive/experiments_2026-07-16.md:
   - CXR base learner  = MULTI-INSTANCE (all in-window CXRs, not 1/patient)
                         + ANATOMY-ROI (aorta+mediastinum+heart segmentation crop)
                         + PCA(32)  reduction (fold-safe)

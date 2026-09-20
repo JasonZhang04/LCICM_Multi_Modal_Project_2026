@@ -5,7 +5,7 @@ An *episode* is one (patient, echo study) = one row of
 `pretrained_checkpoints/episodes.csv`, produced by `scripts/build_episode_cohort.py`.
 This replaces the patient-level `cohort_triple.csv` used by v1-v7, which collapsed
 each patient's whole echo history into a single worst-ever label anchored on the
-patient's earliest measurement date (see notes/experiments_2026-07-23*).
+patient's earliest measurement date (see notes/DESIGN_CONSOLIDATION_2026-09-20.md).
 
 The modelling UNIT is the episode; the GROUPING unit for cross-validation and
 bootstrap remains the patient (`subject_id`), because a patient's repeated echoes
