@@ -1,4 +1,19 @@
 """
+DEPRECATED -- do not run. Superseded by build_temporal_holdout_v2.py.
+
+Two defects (scientific review 2026-09-14):
+  A4  anchor_year_group is the PATIENT's anchor era, not the episode's calendar era.
+      MIMIC shifts each patient independently, so splitting on the anchor group put
+      5,196 episodes with an implied earliest year >= 2014 into "training" while
+      calling the 2014-2016 anchor group the later era, and left 20 nominal-holdout
+      episodes with an implied latest year < 2014.
+  A3  this script only WRITES assignments. Training scripts load every episode unless
+      HOLDOUT=1 is passed, so all 6,220 root / 5,632 ascending "holdout" episodes
+      appear in the development OOF file. Those patients are NOT untouched and must
+      never be described as a quarantined or temporal validation set.
+
+Kept for provenance only.
+
 Quarantine a temporal held-out test set on anchor_year_group.
 
 MIMIC date-shifts every patient into a 3-year anchor_year_group bucket, so calendar
@@ -25,6 +40,10 @@ PATIENTS = "/scratch4/rsteven1/physionet.org/files/mimiciv/3.1/hosp/patients.csv
 
 
 def main():
+    raise SystemExit(
+        "build_temporal_holdout.py is DEPRECATED (review A3/A4). "
+        "Use scripts/build_temporal_holdout_v2.py, which is interval-aware and writes "
+        "episode_split_v2.csv with an honest develop/quarantine/exploratory_era label.")
     from multimodal_aorta.data.episodes import load_episodes
     ep = load_episodes(PC, require_ecg=False)
     pat = pd.read_csv(PATIENTS, usecols=["subject_id", "anchor_year_group"])

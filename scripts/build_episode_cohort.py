@@ -55,6 +55,7 @@ ECG_RECS = ("/scratch4/rsteven1/mimic-iv-ecg-diagnostic-electrocardiogram-"
 
 SITES = {"sinus_diam": "root_cm", "ascending_diam": "asc_cm"}
 DIAM_RANGE = (1.5, 7.0)   # cm; same plausibility bounds the v3 pipeline used
+SEC_PER_DAY = 86400
 
 
 def load_aortic_rows(path: str, chunksize: int = 2_000_000) -> pd.DataFrame:
@@ -106,10 +107,22 @@ def build_episodes(rows: pd.DataFrame, sep_days: int) -> pd.DataFrame:
 
 def load_modality_indexes() -> tuple[dict, dict]:
     """Per-subject arrays of (dates, dicom_ids) for frontal CXR, and dates for ECG."""
-    cx = pd.read_csv(CXR_META, usecols=["subject_id", "dicom_id", "ViewPosition", "StudyDate"])
+    # FULL TIMESTAMPS (review A5). Using StudyDate alone truncated both modalities to
+    # whole days, which let 1,931 image-episode rows across 1,572 episodes carry a CXR
+    # taken up to 22.7 h AFTER the echo while still counting as "pre-index". StudyTime
+    # is present and parses for every row in this metadata table.
+    cx = pd.read_csv(CXR_META,
+                     usecols=["subject_id", "dicom_id", "ViewPosition", "StudyDate", "StudyTime"])
     cx = cx[cx["ViewPosition"].isin(["PA", "AP"])].copy()
-    cx["date"] = pd.to_datetime(cx["StudyDate"].astype("Int64").astype(str),
-                                format="%Y%m%d", errors="coerce")
+    _d = cx["StudyDate"].astype("Int64").astype(str)
+    _t = cx["StudyTime"].astype(float).map(lambda t: "%06d" % int(t) if pd.notna(t) else "")
+    cx["date"] = pd.to_datetime(_d + " " + _t, format="%Y%m%d %H%M%S", errors="coerce")
+    # fall back to midnight only where StudyTime is genuinely absent; midnight is the
+    # conservative choice because it makes the CXR look EARLIER, never later.
+    _fallback = cx["date"].isna()
+    if _fallback.any():
+        cx.loc[_fallback, "date"] = pd.to_datetime(_d[_fallback], format="%Y%m%d", errors="coerce")
+        print(f"  CXR rows without usable StudyTime (floored to midnight): {int(_fallback.sum()):,}")
     cx = cx[cx["date"].notna()]
     eg = pd.read_csv(ECG_RECS, usecols=["subject_id", "ecg_time"])
     eg["date"] = pd.to_datetime(eg["ecg_time"], errors="coerce")
@@ -117,9 +130,10 @@ def load_modality_indexes() -> tuple[dict, dict]:
     print(f"  frontal CXRs {len(cx):,} / {cx.subject_id.nunique():,} pts | "
           f"ECGs {len(eg):,} / {eg.subject_id.nunique():,} pts")
 
-    cxr_idx = {s: (g["date"].values.astype("datetime64[D]").astype(int),
+    # keep SECOND resolution (was datetime64[D], which is what discarded the time)
+    cxr_idx = {s: (g["date"].values.astype("datetime64[s]").astype(np.int64),
                    g["dicom_id"].values) for s, g in cx.groupby("subject_id")}
-    ecg_idx = {s: g["date"].values.astype("datetime64[D]").astype(int)
+    ecg_idx = {s: g["date"].values.astype("datetime64[s]").astype(np.int64)
                for s, g in eg.groupby("subject_id")}
     return cxr_idx, ecg_idx
 
@@ -134,19 +148,22 @@ def match_modalities(ep, cxr_idx, ecg_idx, cxr_win, ecg_win):
         cdates, cids = got
         edates = ecg_idx.get(sid)
         for r in g.itertuples(index=False):
-            anchor = np.datetime64(r.echo_dt, "D").astype(int)
-            lag = cdates - anchor                      # <=0 means CXR precedes echo
-            sel = (lag <= 0) & (lag >= -cxr_win)
+            # second-resolution anchor: a strictly-before rule now means strictly before
+            # the recorded echo TIME, not merely before midnight of the echo day.
+            anchor = np.datetime64(r.echo_dt, "s").astype(np.int64)
+            lag = cdates - anchor                      # <0 means CXR precedes echo
+            sel = (lag < 0) & (lag >= -cxr_win * SEC_PER_DAY)
             if not sel.any():
                 continue
             n_ecg = 0
             if edates is not None:
                 el = edates - anchor
-                n_ecg = int(((el <= 0) & (el >= -ecg_win)).sum())
+                n_ecg = int(((el < 0) & (el >= -ecg_win * SEC_PER_DAY)).sum())
             ep_rows.append((sid, r.measurement_id, r.echo_dt, r.root_cm, r.asc_cm,
                             bool(r.both_sites), int(sel.sum()), n_ecg))
             for did, l in zip(cids[sel], lag[sel]):
-                inst_rows.append((sid, r.measurement_id, did, int(-l)))
+                # fractional days retained; downstream lag bins must not assume integers
+                inst_rows.append((sid, r.measurement_id, did, -l / SEC_PER_DAY))
 
     episodes = pd.DataFrame(ep_rows, columns=[
         "subject_id", "measurement_id", "echo_dt", "root_cm", "asc_cm",

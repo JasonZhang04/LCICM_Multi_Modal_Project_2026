@@ -28,6 +28,11 @@ SMOKE = os.environ.get("SMOKE", "0") == "1"
 HOLDOUT = os.environ.get("HOLDOUT", "0") == "1"   # temporal train-era -> holdout-era split
 SEED = int(os.environ.get("SEED", "42"))
 FT_BLOCKS = int(os.environ.get("FT_BLOCKS", "2"))          # unfreeze the last FT_BLOCKS of 12
+# review A9: which preprocessing cache to train on. legacy = 224 square-squash +
+# ImageNet per-channel normalization (what every saved result used); ckpt_norm = the
+# same geometry with RAD-DINO's own grayscale statistics; ckpt_full = 518 + center crop.
+CXR_PREPROC = os.environ.get("CXR_PREPROC", "legacy")
+_PSUF = "" if CXR_PREPROC == "legacy" else f"_{CXR_PREPROC}"
 BATCH = int(os.environ.get("BATCH", "32"))
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "60" if SMOKE else "6000"))
 VAL_EVERY = 20 if SMOKE else 300
@@ -48,6 +53,7 @@ def main():
     torch.manual_seed(SEED); np.random.seed(SEED)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = Config()
+    cfg.data.cxr_preproc = CXR_PREPROC   # review A9; also governs the load_cxr fallback
 
     ep = load_episodes(PC, require_ecg=False)
     fold = load_episode_fold_id_map(os.path.join(PC, "episode_fold_assignments.csv"))
@@ -75,15 +81,20 @@ def main():
 
     # Fast path: read the preprocessed 224x224 tensors from the memmap cache instead of
     # decoding a JPG per image per epoch. Falls back to load_cxr if the cache is absent.
-    cache_path = os.path.join(PC, "cxr_image_cache.npy")
+    cache_path = os.path.join(PC, f"cxr_image_cache{_PSUF}.npy")
     CACHE = crow_of = None
+    if not os.path.exists(cache_path) and CXR_PREPROC != "legacy":
+        # never silently fall back to the legacy cache: that would run the experiment
+        # against the wrong preprocessing and report it as the new mode.
+        raise SystemExit(f"CXR_PREPROC={CXR_PREPROC} needs {cache_path}; build it with "
+                         f"CXR_PREPROC={CXR_PREPROC} sbatch scripts/slurm_extract_cxr_image_cache.sh")
     if os.path.exists(cache_path):
         CACHE = np.load(cache_path, mmap_mode="r")
-        cidx = pd.read_csv(os.path.join(PC, "cxr_image_cache_index.csv"))
+        cidx = pd.read_csv(os.path.join(PC, f"cxr_image_cache{_PSUF}_index.csv"))
         crow_of = dict(zip(cidx.dicom_id.astype(str), cidx.row))
         inst["crow"] = inst.dicom_id.map(crow_of)
         inst = inst[inst.crow.notna()].reset_index(drop=True); inst["crow"] = inst.crow.astype(int)
-        log.info("using image cache %s", CACHE.shape)
+        log.info("using image cache %s (CXR_PREPROC=%s)", CACHE.shape, CXR_PREPROC)
     log.info("image rows %d | episodes %d | device %s | FT_BLOCKS=%d SMOKE=%s",
              len(inst), inst.episode_id.nunique(), dev, FT_BLOCKS, SMOKE)
 
@@ -101,9 +112,17 @@ def main():
                 if self.train:
                     x = x + torch.randn_like(x) * 0.02                 # light augmentation
             else:
-                x = load_cxr(self.p[i], cfg.data, is_train=self.train)  # (3,H,W)
+                x = load_cxr(self.p[i], cfg.data, is_train=self.train)  # (3,H,W), same mode as the cache
             return x, torch.from_numpy(self.Z[i]), torch.from_numpy(self.mask[i]), i
 
+    # training-curve logger (review: no curves were being recorded); same out_dir rule as below
+    from multimodal_aorta.training.curves import CurveLogger
+    _out_dir_early = os.path.join(ROOT, "outputs", os.environ.get(
+        "OUT_DIR", "cxr_finetune_episode" + ("_smoke" if SMOKE else "_holdout" if HOLDOUT else "") + _PSUF))
+    CURVES = CurveLogger(_out_dir_early, run_name="cxr_finetune",
+                         meta={"seed": SEED, "ft_blocks": FT_BLOCKS, "batch": BATCH, "max_steps": MAX_STEPS,
+                               "val_every": VAL_EVERY, "patience": PATIENCE, "cxr_preproc": CXR_PREPROC,
+                               "loss": "masked MSE on standardized [root, asc]"})
     folds = sorted(inst.fold_id.unique())
     if SMOKE: folds = folds[:1]
     if HOLDOUT: folds = [1]                       # predict holdout-era, train on train-era only
@@ -135,12 +154,13 @@ def main():
             enc.train(); head.train(); return tot / max(w, 1)
 
         best, best_state, bad, step, t0, stop = 1e9, None, 0, 0, time.time(), False
-        enc.train(); head.train()
+        enc.train(); head.train(); CURVES.new_fold()
         while not stop:
             for x, z, m, _ in dl:
                 x, z, m = x.to(dev), z.to(dev), m.to(dev)
                 loss = (((head(enc(x)) - z) ** 2) * m).sum() / m.sum().clamp(min=1)
                 opt.zero_grad(); loss.backward(); opt.step(); step += 1
+                CURVES.train_step(loss.item())
                 if step % VAL_EVERY == 0:
                     vl = run_val()
                     if vl < best - 1e-4:
@@ -150,6 +170,8 @@ def main():
                     else:
                         bad += 1
                     log.info("  fold %d step %d val %.4f (best %.4f bad %d) %.0fs", k, step, vl, best, bad, time.time() - t0)
+                    CURVES.eval_point(fold=int(k), step=step, val_loss=vl, best=best, bad=bad,
+                                      lr=opt.param_groups[0]["lr"])
                 if bad >= PATIENCE or step >= MAX_STEPS:
                     stop = True; break
         if best_state:
@@ -167,8 +189,9 @@ def main():
         log.info("fold %d done (fit imgs %d, test imgs %d)", k, len(fit_df), len(te_df))
 
     # aggregate image preds -> episode, evaluate + save
-    out_dir = os.path.join(ROOT, "outputs", "cxr_finetune_episode" +
-                           ("_smoke" if SMOKE else "_holdout" if HOLDOUT else ""))
+    out_dir = os.path.join(ROOT, "outputs", os.environ.get(
+        "OUT_DIR", "cxr_finetune_episode" +
+        ("_smoke" if SMOKE else "_holdout" if HOLDOUT else "") + _PSUF))
     os.makedirs(out_dir, exist_ok=True)
     rows, res = [], {"seed": SEED, "ft_blocks": FT_BLOCKS, "smoke": SMOKE, "sites": {}}
     sid_of = dict(zip(ep.episode_id.astype(str), ep.subject_id))
@@ -190,7 +213,8 @@ def main():
     pd.DataFrame(rows).to_csv(os.path.join(out_dir, "oof_predictions.csv"), index=False)
     with open(os.path.join(out_dir, "results.json"), "w") as f:
         json.dump(res, f, indent=2)
-    log.info("Saved -> %s", out_dir)
+    CURVES.close()
+    log.info("Saved -> %s (+ training_curves.csv)", out_dir)
 
 
 if __name__ == "__main__":

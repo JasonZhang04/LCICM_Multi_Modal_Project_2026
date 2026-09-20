@@ -86,6 +86,14 @@ def main():
     oof = {t: np.full(len(coh), np.nan) for t in ("root_cm", "asc_cm")}
     EMB_DIM = 256                                    # ECGResNet penultimate width
     emb_oof = np.full((len(coh), EMB_DIM), np.nan, dtype=np.float32)
+    # training-curve logger (review: no curves were being recorded); same out_dir rule as below
+    from multimodal_aorta.training.curves import CurveLogger
+    _out_dir_early = os.path.join(ROOT, "outputs", "ecg_waveform_episode" +
+                                  ("_smoke" if SMOKE else "_holdout" if HOLDOUT else "_broad" if BROAD else ""))
+    CURVES = CurveLogger(_out_dir_early, run_name="ecg_waveform",
+                         meta={"seed": SEED, "batch": BATCH, "lr": LR, "warmup": WARMUP, "max_steps": MAX_STEPS,
+                               "val_every": VAL_EVERY, "patience": PATIENCE, "broad": BROAD,
+                               "loss": "masked MSE on standardized [root, asc, hr]; val = diameters only"})
     for k in folds:
         tr_df = coh[coh.fold_id != k]
         te_df = coh[coh.fold_id == k]
@@ -114,7 +122,7 @@ def main():
             model.train(); return tot / max(w, 1)
 
         best, best_state, bad, step = 1e9, None, 0, 0
-        t0 = time.time(); stop = False
+        t0 = time.time(); stop = False; CURVES.new_fold()
         while not stop:
             for x, z, m in dl:
                 lr = LR * min(1.0, (step + 1) / WARMUP)
@@ -124,6 +132,7 @@ def main():
                 loss = (((p - z) ** 2) * m).sum() / m.sum().clamp(min=1)
                 opt.zero_grad(); loss.backward(); opt.step()
                 step += 1
+                CURVES.train_step(loss.item())
                 if step % VAL_EVERY == 0:
                     vl = val_loss()
                     if vl < best - 1e-4:
@@ -131,6 +140,7 @@ def main():
                     else:
                         bad += 1
                     log.info("  fold %d step %d val %.4f (best %.4f, bad %d) %.0fs", k, step, vl, best, bad, time.time() - t0)
+                    CURVES.eval_point(fold=int(k), step=step, val_loss=vl, best=best, bad=bad, lr=lr)
                 if bad >= PATIENCE or step >= MAX_STEPS:
                     stop = True; break
 
@@ -175,6 +185,7 @@ def main():
     # per-episode OOF penultimate embedding (leakage-free) for feature-level fusion
     has_emb = ~np.isnan(emb_oof[:, 0])
     np.save(os.path.join(out_dir, "ecg_embeddings.npy"), emb_oof[has_emb].astype(np.float32))
+    CURVES.close()
     coh.loc[has_emb, ["episode_id", "subject_id"]].to_csv(
         os.path.join(out_dir, "ecg_embedding_index.csv"), index=False)
     log.info("Saved -> %s (+ ecg_embeddings.npy %s)", out_dir, emb_oof[has_emb].shape)

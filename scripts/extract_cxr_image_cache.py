@@ -23,7 +23,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(me
 log = logging.getLogger(__name__)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PC = os.path.join(ROOT, "pretrained_checkpoints")
-S = 224
+# review A9: cache is now mode-tagged so preprocessing variants cannot overwrite each
+# other or be silently mixed. CXR_PREPROC=legacy|ckpt_norm|ckpt_full.
+MODE = os.environ.get("CXR_PREPROC", "legacy")
+S = 518 if MODE == "ckpt_full" else 224
+SUFFIX = "" if MODE == "legacy" else f"_{MODE}"
 _CFG = None
 
 
@@ -32,6 +36,7 @@ def _init():
     sys.path.insert(0, os.path.join(ROOT, "src"))
     from multimodal_aorta.configs.default_config import Config
     _CFG = Config()
+    _CFG.data.cxr_preproc = MODE
 
 
 def _load(args):
@@ -47,10 +52,10 @@ def main():
     inst = pd.read_csv(os.path.join(PC, "cxr_instances_episode.csv"))
     inst = inst[inst.on_disk.fillna(False).astype(bool)].drop_duplicates("dicom_id").reset_index(drop=True)
     n = len(inst)
-    log.info("caching %d unique on-disk CXRs -> (%d,3,%d,%d) float16 (%.1f GB)",
-             n, n, S, S, n * 3 * S * S * 2 / 1e9)
+    log.info("CXR_PREPROC=%s | caching %d unique on-disk CXRs -> (%d,3,%d,%d) float16 (%.1f GB)",
+             MODE, n, n, S, S, n * 3 * S * S * 2 / 1e9)
 
-    out_path = os.path.join(PC, "cxr_image_cache.npy")
+    out_path = os.path.join(PC, f"cxr_image_cache{SUFFIX}.npy")
     arr = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float16, shape=(n, 3, S, S))
     ok = np.zeros(n, bool)
     nfail = done = 0
@@ -66,7 +71,7 @@ def main():
                 arr.flush(); log.info("  %d/%d (fail=%d)", done, n, nfail)
     arr.flush()
     inst.assign(row=np.arange(n))[ok][["dicom_id", "row"]].to_csv(
-        os.path.join(PC, "cxr_image_cache_index.csv"), index=False)
+        os.path.join(PC, f"cxr_image_cache{SUFFIX}_index.csv"), index=False)
     log.info("saved %s + index (%d ok, %d fail) with %d workers", out_path, int(ok.sum()), nfail, nproc)
 
 

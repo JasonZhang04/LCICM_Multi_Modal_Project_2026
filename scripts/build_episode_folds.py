@@ -68,6 +68,22 @@ def main():
     assert out["episode_id"].is_unique, "duplicate episode_id"
     assert set(out["fold_id"].unique()) == set(range(N_SPLITS)), "fold ids not contiguous"
 
+    # GUARD: this file is the project's "immutable" fold definition. Every saved OOF
+    # prediction, embedding and metric was generated against it, and they are joined by
+    # episode_id with no fold provenance recorded. Silently overwriting it would make
+    # existing results non-comparable in a way that is very hard to detect afterwards.
+    # Overwrite only deliberately: FORCE=1, and the old file is archived beside it.
+    if os.path.exists(out_path) and os.environ.get("FORCE", "0") != "1":
+        raise SystemExit(
+            f"{out_path} already exists.\n"
+            "Existing results were generated against it; regenerating changes fold\n"
+            "membership and invalidates them. See notes/cohort_v2_promotion_runbook.md.\n"
+            "To proceed deliberately: FORCE=1 python scripts/build_episode_folds.py")
+    if os.path.exists(out_path):
+        import shutil, time
+        bak = out_path.replace(".csv", f".bak_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+        shutil.copy2(out_path, bak)
+        log.warning("FORCE=1: archived previous fold assignments -> %s", bak)
     out.to_csv(out_path, index=False)
     log.info("Wrote %s (episodes=%d, patients=%d, folds=%d, seed=%d)",
              out_path, len(out), out.subject_id.nunique(), N_SPLITS, SEED)

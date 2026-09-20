@@ -33,7 +33,7 @@ import pandas as pd
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-CUTS = {"ge40": 4.0, "ge45": 4.5}
+CUTS = {"ge40": 4.0, "ge45": 4.5, "ge50": 5.0}
 
 
 def _f1(ppv, sens):

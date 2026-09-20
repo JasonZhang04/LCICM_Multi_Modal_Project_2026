@@ -107,10 +107,31 @@ class DataConfig:
 
     # --- CXR preprocessing ---
     cxr_image_size: int = 224
+    # --- CXR preprocessing mode (review A9) ---------------------------------
+    # "legacy"   : 224 square-squash + ImageNet per-channel normalization. What every
+    #              saved result to date used. Kept so old runs stay reproducible.
+    # "ckpt_norm": same 224 geometry, but the RAD-DINO checkpoint's own grayscale
+    #              normalization (equal channels) and bicubic interpolation. Isolates
+    #              NORMALIZATION from resolution -- roadmap experiment C1, step 1.
+    # "ckpt_full": the released processor: shortest edge 518, bicubic, center crop 518,
+    #              grayscale normalization. Changes normalization AND geometry, and
+    #              the center crop can clip peripheral anatomy -- a benchmark, not an
+    #              automatic final choice.
+    cxr_preproc: str = "legacy"
+    # RAD-DINO checkpoint spec (preprocessor_config.json). The channels are EQUAL
+    # because a chest X-ray's three channels are identical; ImageNet's unequal values
+    # divide them by three different stds, injecting a spurious colour gradient.
+    cxr_ckpt_mean: tuple = (0.5307, 0.5307, 0.5307)
+    cxr_ckpt_std: tuple = (0.2583, 0.2583, 0.2583)
+    cxr_ckpt_size: int = 518
     cxr_imagenet_mean: tuple = (0.485, 0.456, 0.406)
     cxr_imagenet_std: tuple = (0.229, 0.224, 0.225)
     # Training augmentations
-    cxr_aug_hflip_p: float = 0.5
+    # Horizontal flip is DISABLED (was 0.5). Mirroring a chest X-ray puts the heart
+    # and aortic arch on the right, which is anatomically wrong and destroys the
+    # left-mediastinal silhouette this model measures. Saved results are unaffected
+    # (fine-tuning reads the val-path cache), but any future training run would be.
+    cxr_aug_hflip_p: float = 0.0
     cxr_aug_rotate_deg: float = 10.0
     cxr_aug_brightness: float = 0.1
     cxr_aug_contrast: float = 0.1

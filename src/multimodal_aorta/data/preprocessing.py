@@ -135,7 +135,8 @@ def load_cxr(path: str, cfg: "DataConfig", is_train: bool = False, roi=None) -> 
          instead of the whole-image CLS token (which dilutes the aortic silhouette).
       4. Resize to cfg.cxr_image_size × cfg.cxr_image_size.
       5. Apply training augmentations or val/test normalization.
-      6. Apply ImageNet normalization.
+      6. Normalize per cfg.cxr_preproc ('legacy' = ImageNet; 'ckpt_norm' /
+         'ckpt_full' = the RAD-DINO checkpoint's grayscale statistics).
 
     Parameters
     ----------
@@ -159,29 +160,46 @@ def load_cxr(path: str, cfg: "DataConfig", is_train: bool = False, roi=None) -> 
         box = (int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))
         img = img.crop(box)
 
-    # --- Transforms ---
-    size = cfg.cxr_image_size
-    mean = list(cfg.cxr_imagenet_mean)
-    std = list(cfg.cxr_imagenet_std)
+    # --- Transforms (review A9: mode-selectable, see Config.cxr_preproc) ---
+    mode = getattr(cfg, "cxr_preproc", "legacy")
+    if mode == "legacy":
+        # 224 square-squash + ImageNet per-channel normalization. Mismatched against
+        # the RAD-DINO checkpoint on normalization, resolution AND aspect ratio, but
+        # it is what every saved result used, so it stays reproducible.
+        size = cfg.cxr_image_size
+        mean, std = list(cfg.cxr_imagenet_mean), list(cfg.cxr_imagenet_std)
+        geom = [T.Resize((size, size))]
+    elif mode == "ckpt_norm":
+        # ONE factor changed vs legacy: checkpoint grayscale normalization + bicubic.
+        # Same 224 square geometry, so the existing cache shape and every downstream
+        # array dimension are unchanged -- this isolates normalization cleanly.
+        size = cfg.cxr_image_size
+        mean, std = list(cfg.cxr_ckpt_mean), list(cfg.cxr_ckpt_std)
+        geom = [T.Resize((size, size), interpolation=T.InterpolationMode.BICUBIC)]
+    elif mode == "ckpt_full":
+        # The released processor: shortest edge 518, bicubic, center crop 518.
+        # NOTE: the center crop can clip peripheral anatomy; compare against a
+        # field-of-view-preserving variant before adopting it.
+        size = cfg.cxr_ckpt_size
+        mean, std = list(cfg.cxr_ckpt_mean), list(cfg.cxr_ckpt_std)
+        geom = [T.Resize(size, interpolation=T.InterpolationMode.BICUBIC),
+                T.CenterCrop(size)]
+    else:
+        raise ValueError(f"unknown cfg.cxr_preproc={mode!r}; "
+                         "expected 'legacy', 'ckpt_norm' or 'ckpt_full'")
 
     if is_train:
-        transform = T.Compose([
-            T.Resize((size, size)),
-            T.RandomHorizontalFlip(p=cfg.cxr_aug_hflip_p),
-            T.RandomRotation(degrees=cfg.cxr_aug_rotate_deg),
-            T.ColorJitter(
-                brightness=cfg.cxr_aug_brightness,
-                contrast=cfg.cxr_aug_contrast,
-            ),
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-        ])
+        aug = []
+        # hflip is opt-in and defaults OFF: mirroring a CXR moves the heart and aortic
+        # arch to the right, destroying the silhouette being measured.
+        if getattr(cfg, "cxr_aug_hflip_p", 0.0) > 0:
+            aug.append(T.RandomHorizontalFlip(p=cfg.cxr_aug_hflip_p))
+        aug += [T.RandomRotation(degrees=cfg.cxr_aug_rotate_deg),
+                T.ColorJitter(brightness=cfg.cxr_aug_brightness,
+                              contrast=cfg.cxr_aug_contrast)]
+        transform = T.Compose(geom + aug + [T.ToTensor(), T.Normalize(mean=mean, std=std)])
     else:
-        transform = T.Compose([
-            T.Resize((size, size)),
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-        ])
+        transform = T.Compose(geom + [T.ToTensor(), T.Normalize(mean=mean, std=std)])
 
     return transform(img)  # (3, H, W) float32
 

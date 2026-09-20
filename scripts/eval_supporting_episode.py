@@ -26,7 +26,11 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 MCID_AUROC = float(os.environ.get("MCID_AUROC", "0.01"))   # pre-specified
 MCID_R2 = float(os.environ.get("MCID_R2", "0.01"))
-LAG_BINS = [(0, 7), (8, 30), (31, 90), (91, 365)]
+# CONTIGUOUS half-open bins [lo, hi) (review A13). The previous inclusive integer
+# bounds (0,7),(8,30),... silently dropped every episode whose MEAN lag fell between
+# bins (e.g. 7.5 d). That already omitted 120 episodes; now that lags are fractional
+# (full-timestamp fix, A5) it would drop far more.
+LAG_BINS = [(0.0, 7.0), (7.0, 30.0), (30.0, 90.0), (90.0, 365.0)]
 
 
 def cluster_boot_diff_dist(y, pa, pb, groups, metric, n_boot=2000, seed=0, need_both=True):
@@ -72,11 +76,12 @@ def main():
         s["lag"] = s.episode_id.map(lag)
         rows = []
         for lo, hi in LAG_BINS:
-            b = s[(s.lag >= lo) & (s.lag <= hi)]
+            # half-open [lo, hi), with the last bin closed so the 365 d edge is kept
+            b = s[(s.lag >= lo) & ((s.lag < hi) if (lo, hi) != LAG_BINS[-1] else (s.lag <= hi))]
             d = b.diam_true.to_numpy(float); p = b.pred_stack.to_numpy(float)
             g = b.episode_id.map(sid_of).to_numpy()
             y40 = np.where(np.isnan(d), np.nan, (d >= 4.0).astype(float))
-            rows.append({"bin": f"{lo}-{hi}d", "n": len(b),
+            rows.append({"bin": f"[{lo:g},{hi:g})d", "n": len(b),
                          "ge40": fmt(cluster_bootstrap_ci(y40, p, g, auroc)),
                          "r2": fmt(cluster_bootstrap_ci(d, p, g, r2, need_both_classes=False))})
         results["lag_sensitivity"][site] = rows
